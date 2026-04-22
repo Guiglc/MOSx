@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+*.exe
+*.pkg
+*.pyz
+*.toc
+*.zip
+*.log
+warn-*.txt
+*.csv

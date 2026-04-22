@@ -1,0 +1,1 @@
+"""MOSx application package."""
