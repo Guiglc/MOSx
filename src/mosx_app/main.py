@@ -11,18 +11,22 @@ import pandas as pd
 from matplotlib import font_manager, rcParams
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from matplotlib.ticker import FuncFormatter
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QAction, QGuiApplication, QImage, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
+    QGridLayout,
     QLabel,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -65,9 +69,12 @@ def _row_widget(*widgets: QWidget) -> QWidget:
     container = QWidget()
     layout = QHBoxLayout(container)
     layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(12)
     for widget in widgets:
         layout.addWidget(widget)
     layout.addStretch(1)
+    container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    container.setFixedHeight(32)
     return container
 
 
@@ -83,6 +90,8 @@ VOLTAGE_UNITS_TO_VOLT = {
     "mV": 1e-3,
     "V": 1.0,
 }
+
+NONE_OPTION = "(None)"
 
 
 def configure_matplotlib_fonts() -> None:
@@ -115,7 +124,11 @@ def guess_column(columns: list[str], keywords: list[str]) -> str | None:
 
 def combo_text(combo: QComboBox) -> str | None:
     text = combo.currentText().strip()
-    return text or None
+    return None if not text or text == NONE_OPTION else text
+
+
+def selected_list_texts(widget: QListWidget) -> list[str]:
+    return [item.text() for item in widget.selectedItems()]
 
 
 def info_message(text: str) -> None:
@@ -151,6 +164,7 @@ def set_app_color_scheme(mode: str) -> bool:
 @dataclass
 class DeviceResult:
     device_key: tuple[Any, ...]
+    device_id: str
     display_key: str
     width_nm: float | None
     length_nm: float | None
@@ -162,7 +176,8 @@ class DeviceResult:
     idl_ua_per_nm: float | None
     vts_v: float | None
     vtl_v: float | None
-    vtgm_v: float | None
+    vtgm_sat_v: float | None
+    vtgm_lin_v: float | None
     details: dict[str, Any]
 
 
@@ -222,21 +237,47 @@ class WlDialog(QDialog):
         self,
         device_keys: list[tuple[Any, ...]],
         existing: dict[tuple[Any, ...], tuple[float, float]],
+        device_id_by_key: dict[tuple[Any, ...], str],
+        vdd_by_device: dict[tuple[Any, ...], float],
+        threshold_constant_by_device: dict[tuple[Any, ...], float],
         polarity_by_device: dict[tuple[Any, ...], str],
+        current_direction_by_device: dict[tuple[Any, ...], float],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Device Setting")
-        self.resize(860, 520)
+        self.resize(1180, 620)
         self._device_keys = device_keys
 
-        self._table = QTableWidget(len(device_keys), 4)
+        self._table = QTableWidget(len(device_keys), 9)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setSelectionMode(QTableWidget.ExtendedSelection)
-        self._table.setHorizontalHeaderLabels(["Device", "Width (nm)", "Length (nm)", "Polarity"])
+        self._table.setHorizontalHeaderLabels(
+            [
+                "ID",
+                "Device",
+                "Width (nm)",
+                "Length (nm)",
+                "Vdd target (V)",
+                "Threshold constant (nA)",
+                "Threshold current (nA)",
+                "Polarity",
+                "Current Direction",
+            ]
+        )
+        self._table.setColumnWidth(0, 80)
+        self._table.setColumnWidth(1, 320)
+        self._table.setColumnWidth(2, 110)
+        self._table.setColumnWidth(3, 110)
+        self._table.setColumnWidth(4, 135)
+        self._table.setColumnWidth(5, 180)
+        self._table.setColumnWidth(6, 170)
+        self._table.setColumnWidth(7, 110)
+        self._table.setColumnWidth(8, 140)
         for row, key in enumerate(device_keys):
             label = " | ".join(str(part) for part in key)
-            self._table.setItem(row, 0, QTableWidgetItem(label))
+            self._table.setItem(row, 0, QTableWidgetItem(device_id_by_key.get(key, f"D{row + 1}")))
+            self._table.setItem(row, 1, QTableWidgetItem(label))
             if key in existing:
                 width, length = existing[key]
                 width_text = str(width)
@@ -244,62 +285,209 @@ class WlDialog(QDialog):
             else:
                 width_text = ""
                 length_text = ""
-            self._table.setItem(row, 1, QTableWidgetItem(width_text))
-            self._table.setItem(row, 2, QTableWidgetItem(length_text))
-            self._table.setItem(row, 3, QTableWidgetItem(polarity_by_device.get(key, "NMOS")))
+            self._table.setItem(row, 2, QTableWidgetItem(width_text))
+            self._table.setItem(row, 3, QTableWidgetItem(length_text))
+            self._table.setItem(row, 4, QTableWidgetItem(str(vdd_by_device.get(key, 1.2))))
+            self._table.setItem(row, 5, QTableWidgetItem(str(threshold_constant_by_device.get(key, 40.0))))
+            self._table.setItem(row, 6, QTableWidgetItem(""))
+            self._table.setCellWidget(row, 7, self._make_choice_combo(["NMOS", "PMOS"], polarity_by_device.get(key, "NMOS")))
+            direction_sign = current_direction_by_device.get(key)
+            if direction_sign is None:
+                direction_sign = -1.0 if polarity_by_device.get(key, "NMOS") == "PMOS" else 1.0
+            self._table.setCellWidget(row, 8, self._make_choice_combo(["Positive", "Negative"], "Negative" if direction_sign < 0 else "Positive"))
+            self._update_threshold_current_for_row(row)
 
-        apply_button = QPushButton("Apply First W/L To All")
+        self._table.itemChanged.connect(self._on_item_changed)
+        self._table.resizeColumnsToContents()
+
+        apply_button = QPushButton("Apply First W/L/VDD/Vt Const. To All")
         apply_button.clicked.connect(self.apply_first_row_to_all)
+        set_selected_wl_button = QPushButton("Set Selected W/L/VDD/Th. Const.")
+        set_selected_wl_button.clicked.connect(self.set_selected_device_parameters)
         clear_button = QPushButton("Clear All W/L")
         clear_button.clicked.connect(self.clear_all_dimensions)
         set_nmos_button = QPushButton("Set Selected NMOS")
         set_nmos_button.clicked.connect(lambda: self.set_selected_polarity("NMOS"))
         set_pmos_button = QPushButton("Set Selected PMOS")
         set_pmos_button.clicked.connect(lambda: self.set_selected_polarity("PMOS"))
+        set_positive_button = QPushButton("Set Selected Positive Id")
+        set_positive_button.clicked.connect(lambda: self.set_selected_current_direction(1.0))
+        set_negative_button = QPushButton("Set Selected Negative Id")
+        set_negative_button.clicked.connect(lambda: self.set_selected_current_direction(-1.0))
         save_button = QPushButton("Save")
         save_button.clicked.connect(self.accept)
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
 
-        button_row = QHBoxLayout()
-        button_row.addWidget(apply_button)
-        button_row.addWidget(clear_button)
-        button_row.addWidget(set_nmos_button)
-        button_row.addWidget(set_pmos_button)
-        button_row.addStretch(1)
-        button_row.addWidget(save_button)
-        button_row.addWidget(cancel_button)
+        wl_group = QGroupBox("W/L/VDD/Vt Const.")
+        wl_layout = QHBoxLayout(wl_group)
+        wl_layout.addWidget(apply_button)
+        wl_layout.addWidget(set_selected_wl_button)
+        wl_layout.addWidget(clear_button)
+
+        polarity_group = QGroupBox("Polarity")
+        polarity_layout = QHBoxLayout(polarity_group)
+        polarity_layout.addWidget(set_nmos_button)
+        polarity_layout.addWidget(set_pmos_button)
+
+        current_group = QGroupBox("Id Direction")
+        current_layout = QHBoxLayout(current_group)
+        current_layout.addWidget(set_positive_button)
+        current_layout.addWidget(set_negative_button)
+
+        first_row = QHBoxLayout()
+        first_row.addWidget(wl_group)
+        first_row.addStretch(1)
+
+        second_row = QHBoxLayout()
+        second_row.addWidget(polarity_group)
+        second_row.addWidget(current_group)
+        second_row.addStretch(1)
+        second_row.addWidget(save_button)
+        second_row.addWidget(cancel_button)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self._table)
-        layout.addLayout(button_row)
+        layout.addLayout(first_row)
+        layout.addLayout(second_row)
+
+    def _make_choice_combo(self, values: list[str], current: str) -> QComboBox:
+        combo = QComboBox()
+        combo.addItems(values)
+        combo.setCurrentText(current if current in values else values[0])
+        combo.setEditable(False)
+        return combo
 
     def apply_first_row_to_all(self) -> None:
         if self._table.rowCount() == 0:
             return
-        width = self._table.item(0, 1).text() if self._table.item(0, 1) else ""
-        length = self._table.item(0, 2).text() if self._table.item(0, 2) else ""
+        width = self._table.item(0, 2).text() if self._table.item(0, 2) else ""
+        length = self._table.item(0, 3).text() if self._table.item(0, 3) else ""
+        vdd = self._table.item(0, 4).text() if self._table.item(0, 4) else ""
+        threshold = self._table.item(0, 5).text() if self._table.item(0, 5) else ""
         for row in range(1, self._table.rowCount()):
-            self._table.setItem(row, 1, QTableWidgetItem(width))
-            self._table.setItem(row, 2, QTableWidgetItem(length))
+            self._table.setItem(row, 2, QTableWidgetItem(width))
+            self._table.setItem(row, 3, QTableWidgetItem(length))
+            self._table.setItem(row, 4, QTableWidgetItem(vdd))
+            self._table.setItem(row, 5, QTableWidgetItem(threshold))
+
+    def _prompt_device_parameters(self) -> tuple[float, float, float, float] | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Set Device Parameters")
+        layout = QFormLayout(dialog)
+
+        width_spin = QDoubleSpinBox(dialog)
+        width_spin.setRange(0.0, 1_000_000_000.0)
+        width_spin.setDecimals(6)
+
+        length_spin = QDoubleSpinBox(dialog)
+        length_spin.setRange(0.0, 1_000_000_000.0)
+        length_spin.setDecimals(6)
+
+        vdd_spin = QDoubleSpinBox(dialog)
+        vdd_spin.setRange(-1_000_000.0, 1_000_000.0)
+        vdd_spin.setDecimals(6)
+        vdd_spin.setValue(1.2)
+
+        threshold_spin = QDoubleSpinBox(dialog)
+        threshold_spin.setRange(0.0, 1_000_000.0)
+        threshold_spin.setDecimals(6)
+        threshold_spin.setValue(40.0)
+
+        layout.addRow("Width (nm)", width_spin)
+        layout.addRow("Length (nm)", length_spin)
+        layout.addRow("Vdd target (V)", vdd_spin)
+        layout.addRow("Threshold constant (nA)", threshold_spin)
+
+        buttons = QHBoxLayout()
+        ok_button = QPushButton("OK", dialog)
+        ok_button.clicked.connect(dialog.accept)
+        cancel_button = QPushButton("Cancel", dialog)
+        cancel_button.clicked.connect(dialog.reject)
+        buttons.addStretch(1)
+        buttons.addWidget(ok_button)
+        buttons.addWidget(cancel_button)
+        layout.addRow(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return (
+            width_spin.value(),
+            length_spin.value(),
+            vdd_spin.value(),
+            threshold_spin.value(),
+        )
+
+    def set_selected_device_parameters(self) -> None:
+        selected_rows = sorted({index.row() for index in self._table.selectionModel().selectedRows()})
+        if not selected_rows:
+            return
+        values = self._prompt_device_parameters()
+        if values is None:
+            return
+        width, length, vdd, threshold = values
+        width_text = f"{width:g}"
+        length_text = f"{length:g}"
+        vdd_text = f"{vdd:g}"
+        threshold_text = f"{threshold:g}"
+        for row in selected_rows:
+            self._table.setItem(row, 2, QTableWidgetItem(width_text))
+            self._table.setItem(row, 3, QTableWidgetItem(length_text))
+            self._table.setItem(row, 4, QTableWidgetItem(vdd_text))
+            self._table.setItem(row, 5, QTableWidgetItem(threshold_text))
 
     def clear_all_dimensions(self) -> None:
         for row in range(self._table.rowCount()):
-            self._table.setItem(row, 1, QTableWidgetItem(""))
             self._table.setItem(row, 2, QTableWidgetItem(""))
+            self._table.setItem(row, 3, QTableWidgetItem(""))
 
     def set_selected_polarity(self, polarity: str) -> None:
         selected_rows = sorted({index.row() for index in self._table.selectionModel().selectedRows()})
         if not selected_rows:
             selected_rows = list(range(self._table.rowCount()))
         for row in selected_rows:
-            self._table.setItem(row, 3, QTableWidgetItem(polarity))
+            combo = self._table.cellWidget(row, 7)
+            if isinstance(combo, QComboBox):
+                combo.setCurrentText(polarity)
+
+    def set_selected_current_direction(self, sign: float) -> None:
+        selected_rows = sorted({index.row() for index in self._table.selectionModel().selectedRows()})
+        if not selected_rows:
+            selected_rows = list(range(self._table.rowCount()))
+        label = "Negative" if sign < 0 else "Positive"
+        for row in selected_rows:
+            combo = self._table.cellWidget(row, 8)
+            if isinstance(combo, QComboBox):
+                combo.setCurrentText(label)
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() in (2, 3, 5):
+            self._update_threshold_current_for_row(item.row())
+
+    def _update_threshold_current_for_row(self, row: int) -> None:
+        width_text = self._table.item(row, 2).text().strip() if self._table.item(row, 2) else ""
+        length_text = self._table.item(row, 3).text().strip() if self._table.item(row, 3) else ""
+        threshold_text = self._table.item(row, 5).text().strip() if self._table.item(row, 5) else ""
+        result_text = ""
+        try:
+            if width_text and length_text and threshold_text:
+                width = float(width_text)
+                length = float(length_text)
+                threshold = float(threshold_text)
+                if not math.isclose(length, 0.0):
+                    result_text = f"{threshold * width / length:.6g}"
+        except ValueError:
+            result_text = ""
+
+        self._table.blockSignals(True)
+        self._table.setItem(row, 6, QTableWidgetItem(result_text))
+        self._table.blockSignals(False)
 
     def values(self) -> dict[tuple[Any, ...], tuple[float, float]]:
         result: dict[tuple[Any, ...], tuple[float, float]] = {}
         for row, key in enumerate(self._device_keys):
-            width_text = self._table.item(row, 1).text().strip()
-            length_text = self._table.item(row, 2).text().strip()
+            width_text = self._table.item(row, 2).text().strip()
+            length_text = self._table.item(row, 3).text().strip()
             if not width_text and not length_text:
                 continue
             if not width_text or not length_text:
@@ -307,12 +495,44 @@ class WlDialog(QDialog):
             result[key] = (float(width_text), float(length_text))
         return result
 
+    def vdd_by_device(self) -> dict[tuple[Any, ...], float]:
+        result: dict[tuple[Any, ...], float] = {}
+        for row, key in enumerate(self._device_keys):
+            item = self._table.item(row, 4)
+            text = item.text().strip() if item else ""
+            result[key] = float(text) if text else 1.2
+        return result
+
+    def threshold_constant_by_device(self) -> dict[tuple[Any, ...], float]:
+        result: dict[tuple[Any, ...], float] = {}
+        for row, key in enumerate(self._device_keys):
+            item = self._table.item(row, 5)
+            text = item.text().strip() if item else ""
+            result[key] = float(text) if text else 40.0
+        return result
+
+    def device_id_by_device(self) -> dict[tuple[Any, ...], str]:
+        result: dict[tuple[Any, ...], str] = {}
+        for row, key in enumerate(self._device_keys):
+            item = self._table.item(row, 0)
+            device_id = item.text().strip() if item else ""
+            result[key] = device_id or f"D{row + 1}"
+        return result
+
     def polarity_by_device(self) -> dict[tuple[Any, ...], str]:
         result: dict[tuple[Any, ...], str] = {}
         for row, key in enumerate(self._device_keys):
-            polarity_item = self._table.item(row, 3)
-            polarity = polarity_item.text().strip().upper() if polarity_item else "NMOS"
+            combo = self._table.cellWidget(row, 7)
+            polarity = combo.currentText().strip().upper() if isinstance(combo, QComboBox) else "NMOS"
             result[key] = "PMOS" if polarity == "PMOS" else "NMOS"
+        return result
+
+    def current_direction_by_device(self) -> dict[tuple[Any, ...], float]:
+        result: dict[tuple[Any, ...], float] = {}
+        for row, key in enumerate(self._device_keys):
+            combo = self._table.cellWidget(row, 8)
+            direction = combo.currentText().strip().lower() if isinstance(combo, QComboBox) else "positive"
+            result[key] = -1.0 if direction.startswith("neg") else 1.0
         return result
 
 
@@ -326,15 +546,21 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("MOSx Parameter Calculator")
-        self.resize(1600, 950)
+        self.resize(1500, 820)
 
         self.dataframe = pd.DataFrame()
         self.preview_model = DataFrameModel()
         self.results_model = DataFrameModel()
+        self.device_lookup_model = DataFrameModel()
         self.device_dimensions: dict[tuple[Any, ...], tuple[float, float]] = {}
         self.device_polarity_by_key: dict[tuple[Any, ...], str] = {}
+        self.device_current_direction_by_key: dict[tuple[Any, ...], float] = {}
+        self.device_id_by_key: dict[tuple[Any, ...], str] = {}
+        self.device_vdd_by_key: dict[tuple[Any, ...], float] = {}
+        self.device_threshold_constant_by_key: dict[tuple[Any, ...], float] = {}
         self.results_by_key: dict[tuple[Any, ...], DeviceResult] = {}
         self.results_frame = pd.DataFrame()
+        self.device_lookup_frame = pd.DataFrame()
 
         self._build_ui()
         self._apply_plot_defaults()
@@ -371,21 +597,27 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(splitter)
 
         config_panel = QWidget()
+        config_panel.setMinimumWidth(430)
+        config_panel.setMaximumWidth(500)
         config_layout = QVBoxLayout(config_panel)
+        config_layout.setContentsMargins(0, 0, 0, 0)
+        config_layout.setSpacing(8)
 
         mapping_group = QGroupBox("Column Mapping")
+        mapping_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         mapping_layout = QFormLayout(mapping_group)
 
         self.group_columns_list = QListWidget()
         self.group_columns_list.setSelectionMode(QListWidget.MultiSelection)
+        self.group_columns_list.setFixedHeight(118)
         mapping_layout.addRow("Device key columns", self.group_columns_list)
         self.dimensions_button = QPushButton("Device Setting")
         self.dimensions_button.clicked.connect(self.open_dimensions_dialog)
         mapping_layout.addRow("", self.dimensions_button)
 
         mapping_layout.addRow(GroupBoxSeparator(mapping_group))
-        self.curve_mode_with_type_radio = QRadioButton("Need curve type column + IdVg selection")
-        self.curve_mode_idvg_only_radio = QRadioButton("Table already contains IdVg only")
+        self.curve_mode_with_type_radio = QRadioButton("Long Table Mode")
+        self.curve_mode_idvg_only_radio = QRadioButton("Wide Table Mode")
         self.curve_mode_with_type_radio.setChecked(True)
         mapping_layout.addRow("Curve mode", _row_widget(self.curve_mode_with_type_radio, self.curve_mode_idvg_only_radio))
 
@@ -395,9 +627,11 @@ class MainWindow(QMainWindow):
         curve_page_with_type_layout = QFormLayout(curve_page_with_type)
         curve_page_with_type_layout.setContentsMargins(0, 0, 0, 0)
         self.curve_type_column_combo = QComboBox()
-        self.idvg_value_combo = QComboBox()
+        self.idvg_value_list = QListWidget()
+        self.idvg_value_list.setSelectionMode(QListWidget.MultiSelection)
+        self.idvg_value_list.setFixedHeight(118)
         curve_page_with_type_layout.addRow("Curve type column", self.curve_type_column_combo)
-        curve_page_with_type_layout.addRow("IdVg curve", self.idvg_value_combo)
+        curve_page_with_type_layout.addRow("IdVg curve", self.idvg_value_list)
         self.curve_mode_stack.addWidget(curve_page_with_type)
 
         curve_page_idvg_only = QWidget()
@@ -409,8 +643,8 @@ class MainWindow(QMainWindow):
         mapping_layout.addRow(self.curve_mode_stack)
 
         mapping_layout.addRow(GroupBoxSeparator(mapping_group))
-        self.bias_mode_column_radio = QRadioButton("Drain bias identified by a column + values")
-        self.bias_mode_columns_radio = QRadioButton("Drain bias uses separate Vg/Id columns")
+        self.bias_mode_column_radio = QRadioButton("Long Table Mode")
+        self.bias_mode_columns_radio = QRadioButton("Wide Table Mode")
         self.bias_mode_column_radio.setChecked(True)
         mapping_layout.addRow("Drain bias mode", _row_widget(self.bias_mode_column_radio, self.bias_mode_columns_radio))
 
@@ -426,7 +660,7 @@ class MainWindow(QMainWindow):
         self.gate_voltage_column_combo = QComboBox()
         self.drain_current_column_combo = QComboBox()
         bias_page_by_column_layout.addRow("Drain bias column", self.drain_bias_column_combo)
-        bias_page_by_column_layout.addRow("Value for VDD / high Vd", self.high_bias_value_combo)
+        bias_page_by_column_layout.addRow("Value for high Vd", self.high_bias_value_combo)
         bias_page_by_column_layout.addRow("Value for low Vd", self.low_bias_value_combo)
         bias_page_by_column_layout.addRow("Gate voltage column", self.gate_voltage_column_combo)
         bias_page_by_column_layout.addRow("Drain current column", self.drain_current_column_combo)
@@ -449,46 +683,38 @@ class MainWindow(QMainWindow):
 
         mapping_layout.addRow(GroupBoxSeparator(mapping_group))
         self.gate_voltage_unit_combo = QComboBox()
-        self.gate_voltage_unit_combo.addItems(["V", "mV"])
+        self.gate_voltage_unit_combo.addItems([NONE_OPTION, "V", "mV"])
+        self.gate_voltage_unit_combo.setCurrentText("V")
         self.drain_current_unit_combo = QComboBox()
-        self.drain_current_unit_combo.addItems(["uA", "nA", "pA", "mA", "A"])
+        self.drain_current_unit_combo.addItems([NONE_OPTION, "uA", "nA", "pA", "mA", "A"])
         self.drain_current_unit_combo.setCurrentText("A")
-        self.threshold_current_positive_radio = QRadioButton("Positive")
-        self.threshold_current_negative_radio = QRadioButton("Negative")
-        self.threshold_current_positive_radio.setChecked(True)
-        mapping_layout.addRow("Gate voltage unit", self.gate_voltage_unit_combo)
-        mapping_layout.addRow("Drain current unit", self.drain_current_unit_combo)
-        mapping_layout.addRow(
-            "Drain current direction",
-            _row_widget(self.threshold_current_positive_radio, self.threshold_current_negative_radio),
-        )
+        unit_row = QWidget()
+        unit_layout = QGridLayout(unit_row)
+        unit_layout.setContentsMargins(0, 0, 0, 0)
+        unit_layout.setHorizontalSpacing(8)
+        unit_layout.setVerticalSpacing(0)
+        unit_row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        unit_row.setFixedHeight(32)
+        self.gate_voltage_unit_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.drain_current_unit_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        unit_layout.addWidget(QLabel("Gate voltage unit"), 0, 0)
+        unit_layout.addWidget(self.gate_voltage_unit_combo, 0, 1)
+        unit_layout.addWidget(QLabel("Drain current unit"), 0, 2)
+        unit_layout.addWidget(self.drain_current_unit_combo, 0, 3)
+        unit_layout.setColumnStretch(0, 2)
+        unit_layout.setColumnStretch(1, 1)
+        unit_layout.setColumnStretch(2, 2)
+        unit_layout.setColumnStretch(3, 1)
+        mapping_layout.addRow(unit_row)
         config_layout.addWidget(mapping_group)
 
-        calc_group = QGroupBox("Calculation Settings")
-        calc_layout = QFormLayout(calc_group)
-
-        self.vdd_spin = QDoubleSpinBox()
-        self.vdd_spin.setDecimals(2)
-        self.vdd_spin.setRange(-1_000_000, 1_000_000)
-        self.vdd_spin.setValue(1.2)
-        self.vdd_spin.setSingleStep(0.01)
-
-        self.threshold_constant_spin = QDoubleSpinBox()
-        self.threshold_constant_spin.setDecimals(2)
-        self.threshold_constant_spin.setRange(0.0, 1_000_000)
-        self.threshold_constant_spin.setValue(40.0)
-        self.threshold_constant_spin.setSuffix(" nA")
-        self.threshold_constant_spin.setSingleStep(1.0)
-
-        calc_layout.addRow("Vdd target (V)", self.vdd_spin)
-        calc_layout.addRow("Threshold constant", self.threshold_constant_spin)
-        config_layout.addWidget(calc_group)
+        config_layout.addStretch(1)
 
         splitter.addWidget(config_panel)
 
         right_splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(right_splitter)
-        splitter.setSizes([720, 880])
+        splitter.setSizes([450, 1150])
 
         right_panel = QTabWidget()
         preview_tab = QWidget()
@@ -508,6 +734,13 @@ class MainWindow(QMainWindow):
         self.results_table.customContextMenuRequested.connect(self.open_results_context_menu)
         self.results_table.clicked.connect(self.sync_plot_device_with_selection)
         results_layout.addWidget(self.results_table)
+        self.device_lookup_table = QTableView()
+        self.device_lookup_table.setModel(self.device_lookup_model)
+        self.device_lookup_table.setAlternatingRowColors(True)
+        self.device_lookup_table.setMaximumHeight(160)
+        self.device_lookup_table.setColumnWidth(0, 80)
+        self.device_lookup_table.horizontalHeader().setStretchLastSection(True)
+        results_layout.addWidget(self.device_lookup_table)
         right_panel.addTab(results_tab, "Results")
 
         plot_tab = QWidget()
@@ -519,12 +752,13 @@ class MainWindow(QMainWindow):
         self.plot_vd_both_radio = QRadioButton("Both Vd")
         self.plot_vd_high_radio = QRadioButton("High Vd")
         self.plot_vd_low_radio = QRadioButton("Low Vd")
-        self.plot_vd_both_radio.setChecked(True)
+        self.plot_abs_log_checkbox = QCheckBox("log10(|Y|)")
         plot_controls_layout.addRow("Device", self.plot_device_combo)
         plot_controls_layout.addRow(
             "Vd selection",
             _row_widget(self.plot_vd_both_radio, self.plot_vd_high_radio, self.plot_vd_low_radio),
         )
+        plot_controls_layout.addRow("Y axis", self.plot_abs_log_checkbox)
         self.plot_button = QPushButton("Plot Selected Device")
         self.plot_button.clicked.connect(self.plot_selected_device)
         plot_controls_layout.addRow("", self.plot_button)
@@ -548,12 +782,12 @@ class MainWindow(QMainWindow):
 
         self.curve_type_column_combo.currentTextChanged.connect(self.refresh_curve_value_choices)
         self.drain_bias_column_combo.currentTextChanged.connect(self.refresh_bias_value_choices)
-        self.vdd_spin.valueChanged.connect(self.auto_select_bias_values)
         self.curve_mode_with_type_radio.toggled.connect(self._update_curve_mode_ui)
         self.bias_mode_column_radio.toggled.connect(self._update_bias_mode_ui)
         self.plot_vd_both_radio.toggled.connect(self.plot_selected_device)
         self.plot_vd_high_radio.toggled.connect(self.plot_selected_device)
         self.plot_vd_low_radio.toggled.connect(self.plot_selected_device)
+        self.plot_abs_log_checkbox.toggled.connect(self.plot_selected_device)
         self._update_curve_mode_ui()
         self._update_bias_mode_ui()
 
@@ -572,11 +806,17 @@ class MainWindow(QMainWindow):
 
     def _update_curve_mode_ui(self) -> None:
         # 0 = needs curve type column, 1 = IdVg-only
-        self.curve_mode_stack.setCurrentIndex(0 if self.curve_mode_with_type_radio.isChecked() else 1)
+        if self.curve_mode_with_type_radio.isChecked():
+            self.curve_mode_stack.setCurrentIndex(0)
+        else:
+            self.curve_mode_stack.setCurrentIndex(1)
 
     def _update_bias_mode_ui(self) -> None:
         # 0 = bias by column, 1 = separate columns
-        self.bias_mode_stack.setCurrentIndex(0 if self.bias_mode_column_radio.isChecked() else 1)
+        if self.bias_mode_column_radio.isChecked():
+            self.bias_mode_stack.setCurrentIndex(0)
+        else:
+            self.bias_mode_stack.setCurrentIndex(1)
 
     def apply_color_scheme(self, mode: str) -> None:
         labels = {
@@ -613,8 +853,6 @@ class MainWindow(QMainWindow):
         for column in columns:
             item = QListWidgetItem(column)
             self.group_columns_list.addItem(item)
-        for index in range(min(3, self.group_columns_list.count())):
-            self.group_columns_list.item(index).setSelected(True)
 
         for combo in [
             self.curve_type_column_combo,
@@ -627,25 +865,8 @@ class MainWindow(QMainWindow):
             self.low_drain_current_column_combo,
         ]:
             combo.clear()
+            combo.addItem(NONE_OPTION)
             combo.addItems(columns)
-
-        curve_guess = guess_column(columns, ["curve", "type", "mode", "source_name", "test", "name"])
-        bias_guess = guess_column(columns, ["bias", "drain", "vd", "condition"])
-        vg_guess = guess_column(columns, ["vg", "gate"])
-        id_guess = guess_column(columns, ["id", "ids", "drain current", "current"])
-
-        if curve_guess:
-            self.curve_type_column_combo.setCurrentText(curve_guess)
-        if bias_guess:
-            self.drain_bias_column_combo.setCurrentText(bias_guess)
-        if vg_guess:
-            self.gate_voltage_column_combo.setCurrentText(vg_guess)
-            self.high_gate_voltage_column_combo.setCurrentText(vg_guess)
-            self.low_gate_voltage_column_combo.setCurrentText(vg_guess)
-        if id_guess:
-            self.drain_current_column_combo.setCurrentText(id_guess)
-            self.high_drain_current_column_combo.setCurrentText(id_guess)
-            self.low_drain_current_column_combo.setCurrentText(id_guess)
 
         self.refresh_curve_value_choices()
         self.refresh_bias_value_choices()
@@ -654,16 +875,16 @@ class MainWindow(QMainWindow):
         return [item.text() for item in self.group_columns_list.selectedItems()]
 
     def refresh_curve_value_choices(self) -> None:
-        self.idvg_value_combo.clear()
+        self.idvg_value_list.clear()
 
         column = combo_text(self.curve_type_column_combo)
         if self.dataframe.empty or not column or column not in self.dataframe.columns:
             return
 
         values = sorted(self.dataframe[column].dropna().astype(str).unique().tolist())
-        self.idvg_value_combo.addItems(values)
-        if "IdVg" in values:
-            self.idvg_value_combo.setCurrentText("IdVg")
+        for value in values:
+            item = QListWidgetItem(value)
+            self.idvg_value_list.addItem(item)
 
     def refresh_bias_value_choices(self) -> None:
         self.high_bias_value_combo.clear()
@@ -671,36 +892,15 @@ class MainWindow(QMainWindow):
 
         column = combo_text(self.drain_bias_column_combo)
         if self.dataframe.empty or not column or column not in self.dataframe.columns:
+            self.high_bias_value_combo.addItem(NONE_OPTION)
+            self.low_bias_value_combo.addItem(NONE_OPTION)
             return
 
         values = sorted(self.dataframe[column].dropna().astype(str).unique().tolist())
+        self.high_bias_value_combo.addItem(NONE_OPTION)
+        self.low_bias_value_combo.addItem(NONE_OPTION)
         self.high_bias_value_combo.addItems(values)
         self.low_bias_value_combo.addItems(values)
-        self.auto_select_bias_values()
-
-    def auto_select_bias_values(self) -> None:
-        values = [self.high_bias_value_combo.itemText(i) for i in range(self.high_bias_value_combo.count())]
-        if not values:
-            return
-
-        parsed_values: list[tuple[float, str]] = []
-        for value in values:
-            try:
-                parsed_values.append((float(value), value))
-            except ValueError:
-                continue
-
-        if parsed_values:
-            # Bias columns are often signed (e.g. PMOS uses negative Vd). Match by magnitude.
-            high_target = abs(self.vdd_spin.value())
-            high_value = min(parsed_values, key=lambda item: abs(abs(item[0]) - high_target))[1]
-            low_value = min(parsed_values, key=lambda item: abs(item[0]))[1]
-            self.high_bias_value_combo.setCurrentText(high_value)
-            self.low_bias_value_combo.setCurrentText(low_value)
-            return
-
-        self.high_bias_value_combo.setCurrentIndex(len(values) - 1)
-        self.low_bias_value_combo.setCurrentIndex(0)
 
     def _device_keys(self) -> list[tuple[Any, ...]]:
         group_columns = self.selected_group_columns()
@@ -708,6 +908,11 @@ class MainWindow(QMainWindow):
             return []
         grouped = self.dataframe[group_columns].drop_duplicates().fillna("")
         return [tuple(row[column] for column in group_columns) for _, row in grouped.iterrows()]
+
+    def _ensure_device_ids(self, device_keys: list[tuple[Any, ...]]) -> None:
+        for index, key in enumerate(device_keys, start=1):
+            if not self.device_id_by_key.get(key):
+                self.device_id_by_key[key] = f"D{index}"
 
     def open_dimensions_dialog(self) -> None:
         if self.dataframe.empty:
@@ -723,27 +928,54 @@ class MainWindow(QMainWindow):
         if not device_keys:
             info_message("No device keys found under the current grouping columns.")
             return
-        dialog = WlDialog(device_keys, self.device_dimensions, self.device_polarity_by_key, self)
+        self._ensure_device_ids(device_keys)
+        dialog = WlDialog(
+            device_keys,
+            self.device_dimensions,
+            self.device_id_by_key,
+            self.device_vdd_by_key,
+            self.device_threshold_constant_by_key,
+            self.device_polarity_by_key,
+            self.device_current_direction_by_key,
+            self,
+        )
         if dialog.exec() == QDialog.Accepted:
             try:
                 self.device_dimensions = dialog.values()
             except ValueError:
                 info_message("Width / Length must be valid numeric values.")
                 return
+            self.device_id_by_key = dialog.device_id_by_device()
+            self.device_vdd_by_key = dialog.vdd_by_device()
+            self.device_threshold_constant_by_key = dialog.threshold_constant_by_device()
             self.device_polarity_by_key = dialog.polarity_by_device()
+            self.device_current_direction_by_key = dialog.current_direction_by_device()
+            self.log(f"Saved device IDs for {len(self.device_id_by_key)} devices.")
+            self.log(f"Saved Vdd target for {len(self.device_vdd_by_key)} devices.")
+            self.log(f"Saved threshold constant for {len(self.device_threshold_constant_by_key)} devices.")
             self.log(f"Saved Width / Length for {len(self.device_dimensions)} devices.")
             self.log(f"Saved polarity for {len(self.device_polarity_by_key)} devices.")
+            self.log(f"Saved current direction for {len(self.device_current_direction_by_key)} devices.")
             self.refresh_plot_devices()
 
     def _config(self) -> dict[str, Any]:
-        curve_mode = "with_type" if self.curve_mode_with_type_radio.isChecked() else "idvg_only"
-        bias_mode = "by_column" if self.bias_mode_column_radio.isChecked() else "by_columns"
+        curve_mode = None
+        if self.curve_mode_with_type_radio.isChecked():
+            curve_mode = "with_type"
+        elif self.curve_mode_idvg_only_radio.isChecked():
+            curve_mode = "idvg_only"
+
+        bias_mode = None
+        if self.bias_mode_column_radio.isChecked():
+            bias_mode = "by_column"
+        elif self.bias_mode_columns_radio.isChecked():
+            bias_mode = "by_columns"
         return {
             "group_columns": self.selected_group_columns(),
             "curve_mode": curve_mode,
             "bias_mode": bias_mode,
             "curve_type_column": combo_text(self.curve_type_column_combo),
-            "idvg_value": combo_text(self.idvg_value_combo),
+            "idvg_values": selected_list_texts(self.idvg_value_list),
             "drain_bias_column": combo_text(self.drain_bias_column_combo),
             "high_bias_value": combo_text(self.high_bias_value_combo),
             "low_bias_value": combo_text(self.low_bias_value_combo),
@@ -755,13 +987,14 @@ class MainWindow(QMainWindow):
             "low_drain_current_column": combo_text(self.low_drain_current_column_combo),
             "gate_voltage_unit": combo_text(self.gate_voltage_unit_combo),
             "drain_current_unit": combo_text(self.drain_current_unit_combo),
-            "vdd_target_v": self.vdd_spin.value(),
-            "threshold_constant_na": self.threshold_constant_spin.value(),
-            "threshold_current_sign": 1.0 if self.threshold_current_positive_radio.isChecked() else -1.0,
         }
 
     def validate_config(self) -> str | None:
         config = self._config()
+        if config["curve_mode"] not in ("with_type", "idvg_only"):
+            return "Please select Curve mode."
+        if config["bias_mode"] not in ("by_column", "by_columns"):
+            return "Please select Drain bias mode."
         if not config["group_columns"]:
             return "Missing required mapping: group_columns"
         if not config["gate_voltage_unit"]:
@@ -772,29 +1005,29 @@ class MainWindow(QMainWindow):
         if config["curve_mode"] == "with_type":
             if not config["curve_type_column"]:
                 return "Missing required mapping: curve_type_column"
-            if not config["idvg_value"]:
-                return "Missing required mapping: idvg_value"
+            if not config["idvg_values"]:
+                return "Missing required mapping: idvg_values"
 
         if config["bias_mode"] == "by_column":
             required = [
                 "drain_bias_column",
-                "high_bias_value",
-                "low_bias_value",
                 "gate_voltage_column",
                 "drain_current_column",
             ]
+            for key in required:
+                if not config.get(key):
+                    return f"Missing required mapping: {key}"
+            if not config["high_bias_value"] and not config["low_bias_value"]:
+                return "Please select at least one Drain bias value."
         else:
-            required = [
-                "high_gate_voltage_column",
-                "high_drain_current_column",
-                "low_gate_voltage_column",
-                "low_drain_current_column",
-            ]
-        for key in required:
-            if not config.get(key):
-                return f"Missing required mapping: {key}"
-        if config["threshold_constant_na"] <= 0:
-            return "Threshold constant must be greater than 0."
+            has_high = bool(config["high_gate_voltage_column"] and config["high_drain_current_column"])
+            has_low = bool(config["low_gate_voltage_column"] and config["low_drain_current_column"])
+            if not has_high and not has_low:
+                return "Please select at least one High/Low Vd column pair."
+            if bool(config["high_gate_voltage_column"]) != bool(config["high_drain_current_column"]):
+                return "High Vd gate/drain current columns must both be set or both be empty."
+            if bool(config["low_gate_voltage_column"]) != bool(config["low_drain_current_column"]):
+                return "Low Vd gate/drain current columns must both be set or both be empty."
         return None
 
     def _extract_idvg_curves(
@@ -809,7 +1042,7 @@ class MainWindow(QMainWindow):
         if config["curve_mode"] == "with_type":
             curve_col = config["curve_type_column"]
             base[curve_col] = base[curve_col].astype(str)
-            base = base[base[curve_col] == str(config["idvg_value"])].copy()
+            base = base[base[curve_col].isin([str(value) for value in config["idvg_values"]])].copy()
 
         if base.empty:
             return pd.DataFrame(), pd.DataFrame()
@@ -824,18 +1057,32 @@ class MainWindow(QMainWindow):
             if base.empty:
                 return pd.DataFrame(), pd.DataFrame()
 
-            high_frame = base[base[bias_col] == str(config["high_bias_value"])].copy().sort_values("_vg_v")
-            low_frame = base[base[bias_col] == str(config["low_bias_value"])].copy().sort_values("_vg_v")
+            high_frame = pd.DataFrame()
+            low_frame = pd.DataFrame()
+            if config["high_bias_value"]:
+                high_frame = base[base[bias_col] == str(config["high_bias_value"])].copy().sort_values("_vg_v")
+            if config["low_bias_value"]:
+                low_frame = base[base[bias_col] == str(config["low_bias_value"])].copy().sort_values("_vg_v")
             return high_frame, low_frame
 
         high = pd.DataFrame()
         low = pd.DataFrame()
-        if config["high_gate_voltage_column"] in base.columns and config["high_drain_current_column"] in base.columns:
+        if (
+            config["high_gate_voltage_column"]
+            and config["high_drain_current_column"]
+            and config["high_gate_voltage_column"] in base.columns
+            and config["high_drain_current_column"] in base.columns
+        ):
             high = base[[config["high_gate_voltage_column"], config["high_drain_current_column"]]].copy()
             high["_vg_v"] = pd.to_numeric(high[config["high_gate_voltage_column"]], errors="coerce") * vg_scale
             high["_id_a"] = pd.to_numeric(high[config["high_drain_current_column"]], errors="coerce") * id_scale
             high = high.dropna(subset=["_vg_v", "_id_a"]).sort_values("_vg_v")
-        if config["low_gate_voltage_column"] in base.columns and config["low_drain_current_column"] in base.columns:
+        if (
+            config["low_gate_voltage_column"]
+            and config["low_drain_current_column"]
+            and config["low_gate_voltage_column"] in base.columns
+            and config["low_drain_current_column"] in base.columns
+        ):
             low = base[[config["low_gate_voltage_column"], config["low_drain_current_column"]]].copy()
             low["_vg_v"] = pd.to_numeric(low[config["low_gate_voltage_column"]], errors="coerce") * vg_scale
             low["_id_a"] = pd.to_numeric(low[config["low_drain_current_column"]], errors="coerce") * id_scale
@@ -857,6 +1104,13 @@ class MainWindow(QMainWindow):
         id_scale = CURRENT_UNITS_TO_AMP[config["drain_current_unit"]]
 
         results: list[DeviceResult] = []
+        device_keys = []
+        for device_key, device_frame in self.dataframe.groupby(config["group_columns"], dropna=False):
+            if not isinstance(device_key, tuple):
+                device_key = (device_key,)
+            device_keys.append(device_key)
+        self._ensure_device_ids(device_keys)
+
         for device_key, device_frame in self.dataframe.groupby(config["group_columns"], dropna=False):
             if not isinstance(device_key, tuple):
                 device_key = (device_key,)
@@ -880,31 +1134,31 @@ class MainWindow(QMainWindow):
             return
 
         self.results_by_key = {result.device_key: result for result in results}
+        parameter_rows = [
+            ("Width (nm)", {result.device_id: result.width_nm for result in results}),
+            ("Length (nm)", {result.device_id: result.length_nm for result in results}),
+            ("Idoff (pA)", {result.device_id: result.idoff_pa for result in results}),
+            ("Idoff/L (pA/nm)", {result.device_id: result.idoff_pa_per_nm for result in results}),
+            ("Ids (uA)", {result.device_id: result.ids_ua for result in results}),
+            ("Ids/L (uA/nm)", {result.device_id: result.ids_ua_per_nm for result in results}),
+            ("Idl (uA)", {result.device_id: result.idl_ua for result in results}),
+            ("Idl/L (uA/nm)", {result.device_id: result.idl_ua_per_nm for result in results}),
+            ("Vts (V)", {result.device_id: result.vts_v for result in results}),
+            ("Vtl (V)", {result.device_id: result.vtl_v for result in results}),
+            ("Vtgm_sat (V)", {result.device_id: result.vtgm_sat_v for result in results}),
+            ("Vtgm_lin (V)", {result.device_id: result.vtgm_lin_v for result in results}),
+        ]
         self.results_frame = pd.DataFrame(
-            [
-                {
-                    "Device": result.display_key,
-                    "Width (nm)": result.width_nm,
-                    "Length (nm)": result.length_nm,
-                    "Idoff (pA)": result.idoff_pa,
-                    "Idoff/L (pA/nm)": result.idoff_pa_per_nm,
-                    "Ids (uA)": result.ids_ua,
-                    "Ids/L (uA/nm)": result.ids_ua_per_nm,
-                    "Idl (uA)": result.idl_ua,
-                    "Idl/L (uA/nm)": result.idl_ua_per_nm,
-                    "Vts (V)": result.vts_v,
-                    "Vtl (V)": result.vtl_v,
-                    "Vtgm (V)": result.vtgm_v,
-                }
-                for result in results
-            ]
+            [{"Parameter": parameter_name, **values_by_device} for parameter_name, values_by_device in parameter_rows]
+        )
+        self.device_lookup_frame = pd.DataFrame(
+            [{"ID": result.device_id, "Device": result.display_key} for result in results]
         )
         self.results_model.set_frame(self.results_frame)
+        self.device_lookup_model.set_frame(self.device_lookup_frame)
         self.log(
             "Calculation settings: "
-            f"Vdd={config['vdd_target_v']:.6g} V, "
-            f"Threshold={config['threshold_constant_na']:.6g} nA * W/L "
-            f"({'positive' if config['threshold_current_sign'] > 0 else 'negative'} Id)"
+            "Per-device Vdd / threshold constant / current direction applied."
         )
         self.log(f"Calculated {len(results)} devices.")
         self.refresh_plot_devices()
@@ -918,6 +1172,7 @@ class MainWindow(QMainWindow):
     ) -> DeviceResult:
         return DeviceResult(
             device_key=device_key,
+            device_id=self.device_id_by_key.get(device_key, "N/A"),
             display_key=" | ".join(str(part) for part in device_key),
             width_nm=width_nm,
             length_nm=length_nm,
@@ -929,7 +1184,8 @@ class MainWindow(QMainWindow):
             idl_ua_per_nm=None,
             vts_v=None,
             vtl_v=None,
-            vtgm_v=None,
+            vtgm_sat_v=None,
+            vtgm_lin_v=None,
             details={},
         )
 
@@ -943,21 +1199,27 @@ class MainWindow(QMainWindow):
         config: dict[str, Any],
     ) -> DeviceResult:
         polarity = self.device_polarity_by_key.get(device_key, "NMOS")
-        polarity_sign = -1.0 if polarity == "PMOS" else 1.0
-        vg_vdd_target_v = abs(config["vdd_target_v"])
+        current_direction_sign = self.device_current_direction_by_key.get(
+            device_key,
+            -1.0 if polarity == "PMOS" else 1.0,
+        )
+        vdd_target_v = self.device_vdd_by_key.get(device_key, 1.2)
+        threshold_constant_na = self.device_threshold_constant_by_key.get(device_key, 40.0)
+        vg_vdd_target_v = abs(vdd_target_v)
 
         idoff_row = self._closest_row(high_frame, target=0.0, column="_vg_v")
         ids_row = self._closest_abs_row(high_frame, target=vg_vdd_target_v, column="_vg_v")
         idl_row = self._closest_abs_row(low_frame, target=vg_vdd_target_v, column="_vg_v")
 
-        target_current_a = config["threshold_current_sign"] * config["threshold_constant_na"] * 1e-9 * (width_nm / length_nm)
+        target_current_a = current_direction_sign * threshold_constant_na * 1e-9 * (width_nm / length_nm)
         vts, vts_details = self._interpolate_vg_for_current(high_frame, target_current_a)
         vtl, vtl_details = self._interpolate_vg_for_current(low_frame, target_current_a)
-        vtgm, vtgm_details = self._calculate_vtgm(high_frame)
+        vtgm_sat, vtgm_sat_details = self._calculate_vtgm(high_frame)
+        vtgm_lin, vtgm_lin_details = self._calculate_vtgm(low_frame)
 
-        idoff_pa = self._current_display_value(idoff_row, polarity_sign, 1e12)
-        ids_ua = self._current_display_value(ids_row, polarity_sign, 1e6)
-        idl_ua = self._current_display_value(idl_row, polarity_sign, 1e6)
+        idoff_pa = self._current_display_value(idoff_row, 1e12)
+        ids_ua = self._current_display_value(ids_row, 1e6)
+        idl_ua = self._current_display_value(idl_row, 1e6)
 
         idoff_pa_per_nm = idoff_pa / length_nm if idoff_pa is not None else None
         ids_ua_per_nm = ids_ua / length_nm if ids_ua is not None else None
@@ -966,19 +1228,23 @@ class MainWindow(QMainWindow):
         details = {
             "high_curve": high_frame,
             "low_curve": low_frame,
-            "idoff_point": None if idoff_row is None else {"vg": float(idoff_row["_vg_v"]), "id": float(idoff_row["_id_a"]), "polarity_sign": polarity_sign},
-            "ids_point": None if ids_row is None else {"vg": float(ids_row["_vg_v"]), "id": float(ids_row["_id_a"]), "polarity_sign": polarity_sign},
-            "idl_point": None if idl_row is None else {"vg": float(idl_row["_vg_v"]), "id": float(idl_row["_id_a"]), "polarity_sign": polarity_sign},
+            "idoff_point": None if idoff_row is None else {"vg": float(idoff_row["_vg_v"]), "id": float(idoff_row["_id_a"]), "current_direction_sign": current_direction_sign},
+            "ids_point": None if ids_row is None else {"vg": float(ids_row["_vg_v"]), "id": float(ids_row["_id_a"]), "current_direction_sign": current_direction_sign},
+            "idl_point": None if idl_row is None else {"vg": float(idl_row["_vg_v"]), "id": float(idl_row["_id_a"]), "current_direction_sign": current_direction_sign},
             "vts": vts_details,
             "vtl": vtl_details,
-            "vtgm": vtgm_details,
+            "vtgm_sat": vtgm_sat_details,
+            "vtgm_lin": vtgm_lin_details,
             "target_current_a": target_current_a,
-            "polarity_sign": polarity_sign,
+            "vdd_target_v": vdd_target_v,
+            "threshold_constant_na": threshold_constant_na,
+            "current_direction_sign": current_direction_sign,
             "polarity": polarity,
         }
 
         return DeviceResult(
             device_key=device_key,
+            device_id=self.device_id_by_key.get(device_key, "N/A"),
             display_key=" | ".join(str(part) for part in device_key),
             width_nm=width_nm,
             length_nm=length_nm,
@@ -990,7 +1256,8 @@ class MainWindow(QMainWindow):
             idl_ua_per_nm=idl_ua_per_nm,
             vts_v=vts,
             vtl_v=vtl,
-            vtgm_v=vtgm,
+            vtgm_sat_v=vtgm_sat,
+            vtgm_lin_v=vtgm_lin,
             details=details,
         )
 
@@ -1006,10 +1273,10 @@ class MainWindow(QMainWindow):
         index = (frame[column].abs() - abs(target)).abs().idxmin()
         return frame.loc[index]
 
-    def _current_display_value(self, row: pd.Series | None, polarity_sign: float, scale: float) -> float | None:
+    def _current_display_value(self, row: pd.Series | None, scale: float) -> float | None:
         if row is None:
             return None
-        current_a = float(row["_id_a"]) * polarity_sign
+        current_a = float(row["_id_a"])
         return current_a * scale
 
     def _interpolate_vg_for_current(
@@ -1078,13 +1345,41 @@ class MainWindow(QMainWindow):
         best = max(candidates, key=lambda item: abs(item["slope_a_per_v"]))
         return float(best["vtgm_v"]), best
 
+    def _curve_derivative_series(
+        self,
+        curve: pd.DataFrame,
+        y_scale: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if len(curve) < 2:
+            return np.array([]), np.array([])
+
+        work = curve[["_vg_v", "_id_a"]].dropna().sort_values("_vg_v").copy()
+        if len(work) < 2:
+            return np.array([]), np.array([])
+
+        x_values = work["_vg_v"].to_numpy(dtype=float)
+        y_values = (work["_id_a"] * y_scale).to_numpy(dtype=float)
+        delta_x = np.diff(x_values)
+        valid = ~np.isclose(delta_x, 0.0)
+        if not valid.any():
+            return np.array([]), np.array([])
+
+        mid_x = (x_values[:-1] + x_values[1:]) / 2
+        slopes = np.diff(y_values) / delta_x
+        return mid_x[valid], slopes[valid]
+
     def _fmt(self, value: float | None) -> str:
         return "" if value is None or pd.isna(value) else f"{value:.6g}"
+
+    def _axis_tick_label(self, value: float, _: float) -> str:
+        if math.isclose(value, 0.0, abs_tol=1e-15):
+            return "0"
+        return f"{value:.2e}" if abs(value) >= 1e4 or abs(value) < 1e-2 else f"{value:.2f}"
 
     def refresh_plot_devices(self) -> None:
         current = self.plot_device_combo.currentText()
         self.plot_device_combo.clear()
-        names = [result.display_key for result in self.results_by_key.values()]
+        names = [result.device_id for result in self.results_by_key.values()]
         self.plot_device_combo.addItems(names)
         if current in names:
             self.plot_device_combo.setCurrentText(current)
@@ -1092,8 +1387,10 @@ class MainWindow(QMainWindow):
     def sync_plot_device_with_selection(self, index: QModelIndex) -> None:
         if not index.isValid() or self.results_frame.empty:
             return
-        device_name = str(self.results_frame.iloc[index.row()]["Device"])
-        self.plot_device_combo.setCurrentText(device_name)
+        if index.column() == 0:
+            return
+        device_id = str(self.results_frame.columns[index.column()])
+        self.plot_device_combo.setCurrentText(device_id)
 
     def plot_selected_device(self) -> None:
         self.canvas.figure.clear()
@@ -1103,13 +1400,31 @@ class MainWindow(QMainWindow):
             return
 
         selected_name = self.plot_device_combo.currentText()
-        result = next((item for item in self.results_by_key.values() if item.display_key == selected_name), None)
+        result = next((item for item in self.results_by_key.values() if item.device_id == selected_name), None)
         if result is None:
             self._apply_plot_defaults()
             self.canvas.draw()
             return
 
         config = self._config()
+        if not config["gate_voltage_unit"] or not config["drain_current_unit"]:
+            ax = self.canvas.figure.add_subplot(111)
+            ax.set_title("Please select Gate/Drain current units before plotting")
+            self._apply_plot_defaults()
+            self.canvas.draw()
+            return
+        if not any(
+            [
+                self.plot_vd_both_radio.isChecked(),
+                self.plot_vd_high_radio.isChecked(),
+                self.plot_vd_low_radio.isChecked(),
+            ]
+        ):
+            ax = self.canvas.figure.add_subplot(111)
+            ax.set_title("Please select a Vd plot mode")
+            self._apply_plot_defaults()
+            self.canvas.draw()
+            return
         vg_scale = VOLTAGE_UNITS_TO_VOLT[config["gate_voltage_unit"]]
         id_scale = CURRENT_UNITS_TO_AMP[config["drain_current_unit"]]
 
@@ -1128,27 +1443,55 @@ class MainWindow(QMainWindow):
             return
 
         polarity = self.device_polarity_by_key.get(result.device_key, "NMOS")
-        polarity_sign = -1.0 if polarity == "PMOS" else 1.0
         y_unit = config["drain_current_unit"]
         y_scale = 1.0 / CURRENT_UNITS_TO_AMP[y_unit]
+        use_abs_log = self.plot_abs_log_checkbox.isChecked()
+
+        ax = self.canvas.figure.add_subplot(111)
+        gm_ax = ax.twinx()
+        gm_plotted = False
 
         def plot_curve(ax, curve: pd.DataFrame, label: str) -> bool:
+            nonlocal gm_plotted
             if curve.empty:
                 return False
             curve = curve.sort_values("_vg_v")
+            y_values = curve["_id_a"] * y_scale
+            if use_abs_log:
+                y_values = y_values.abs()
+                valid_mask = y_values > 0
+                if not valid_mask.any():
+                    return False
+                x_values = curve.loc[valid_mask, "_vg_v"]
+                y_values = y_values.loc[valid_mask]
+            else:
+                x_values = curve["_vg_v"]
             ax.plot(
-                curve["_vg_v"],
-                curve["_id_a"] * polarity_sign * y_scale,
+                x_values,
+                y_values,
                 marker="o",
                 linewidth=1.2,
                 label=label,
             )
+
+            derivative_x, derivative_y = self._curve_derivative_series(curve, y_scale)
+            if len(derivative_x) > 0:
+                line_color = ax.lines[-1].get_color()
+                gm_ax.plot(
+                    derivative_x,
+                    derivative_y,
+                    linestyle="--",
+                    linewidth=1.2,
+                    color=line_color,
+                    alpha=0.9,
+                    label=f"{label} dId/dVg",
+                )
+                gm_plotted = True
             return True
 
         high_label = f"High Vd: {config['high_bias_value']}" if config["bias_mode"] == "by_column" else "High Vd"
         low_label = f"Low Vd: {config['low_bias_value']}" if config["bias_mode"] == "by_column" else "Low Vd"
 
-        ax = self.canvas.figure.add_subplot(111)
         plotted = False
         if self.plot_vd_both_radio.isChecked():
             plotted |= plot_curve(ax, high_curve, high_label)
@@ -1157,9 +1500,11 @@ class MainWindow(QMainWindow):
         elif self.plot_vd_high_radio.isChecked():
             plotted |= plot_curve(ax, high_curve, high_label)
             mode_title = "High Vd"
-        else:
+        elif self.plot_vd_low_radio.isChecked():
             plotted |= plot_curve(ax, low_curve, low_label)
             mode_title = "Low Vd"
+        else:
+            mode_title = "No Vd Selection"
 
         if not plotted:
             ax = self.canvas.figure.add_subplot(111)
@@ -1169,9 +1514,24 @@ class MainWindow(QMainWindow):
             return
 
         ax.set_xlabel("Gate Voltage (V)")
-        ax.set_ylabel(f"Drain Current ({y_unit})")
+        ax.set_ylabel(f"{'|Drain Current|' if use_abs_log else 'Drain Current'} ({y_unit})")
         ax.set_title(mode_title)
-        ax.legend()
+        if use_abs_log:
+            ax.set_yscale("log")
+        ax.yaxis.set_major_formatter(FuncFormatter(self._axis_tick_label))
+        ax.yaxis.offsetText.set_visible(False)
+        if gm_plotted:
+            gm_ax.set_ylabel(f"dId/dVg ({y_unit}/V)")
+            gm_ax.yaxis.set_major_formatter(FuncFormatter(self._axis_tick_label))
+            gm_ax.yaxis.offsetText.set_visible(False)
+            gm_ax.tick_params(colors="#000000")
+            gm_ax.yaxis.label.set_color("#000000")
+            lines_1, labels_1 = ax.get_legend_handles_labels()
+            lines_2, labels_2 = gm_ax.get_legend_handles_labels()
+            ax.legend(lines_1 + lines_2, labels_1 + labels_2)
+        else:
+            gm_ax.set_visible(False)
+            ax.legend()
         self.canvas.figure.suptitle(f"{result.display_key} | IdVg")
 
         self.canvas.figure.tight_layout()
