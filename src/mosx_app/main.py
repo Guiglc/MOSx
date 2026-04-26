@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QStackedWidget,
     QTableView,
@@ -239,6 +240,8 @@ class WlDialog(QDialog):
         existing: dict[tuple[Any, ...], tuple[float, float]],
         device_id_by_key: dict[tuple[Any, ...], str],
         vdd_by_device: dict[tuple[Any, ...], float],
+        high_vd_by_device: dict[tuple[Any, ...], float],
+        low_vd_by_device: dict[tuple[Any, ...], float],
         threshold_constant_by_device: dict[tuple[Any, ...], float],
         polarity_by_device: dict[tuple[Any, ...], str],
         current_direction_by_device: dict[tuple[Any, ...], float],
@@ -246,10 +249,10 @@ class WlDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Device Setting")
-        self.resize(1180, 620)
+        self.resize(1480, 620)
         self._device_keys = device_keys
 
-        self._table = QTableWidget(len(device_keys), 9)
+        self._table = QTableWidget(len(device_keys), 11)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setSelectionMode(QTableWidget.ExtendedSelection)
         self._table.setHorizontalHeaderLabels(
@@ -259,21 +262,25 @@ class WlDialog(QDialog):
                 "Width (nm)",
                 "Length (nm)",
                 "Vdd target (V)",
-                "Threshold constant (nA)",
-                "Threshold current (nA)",
+                "High Vd (V)",
+                "Low Vd (V)",
+                "Vth Const. (nA)",
+                "Vth Current (nA)",
                 "Polarity",
                 "Current Direction",
             ]
         )
         self._table.setColumnWidth(0, 80)
-        self._table.setColumnWidth(1, 320)
+        self._table.setColumnWidth(1, 360)
         self._table.setColumnWidth(2, 110)
         self._table.setColumnWidth(3, 110)
-        self._table.setColumnWidth(4, 135)
-        self._table.setColumnWidth(5, 180)
-        self._table.setColumnWidth(6, 170)
-        self._table.setColumnWidth(7, 110)
-        self._table.setColumnWidth(8, 140)
+        self._table.setColumnWidth(4, 115)
+        self._table.setColumnWidth(5, 95)
+        self._table.setColumnWidth(6, 95)
+        self._table.setColumnWidth(7, 135)
+        self._table.setColumnWidth(8, 145)
+        self._table.setColumnWidth(9, 110)
+        self._table.setColumnWidth(10, 140)
         for row, key in enumerate(device_keys):
             label = " | ".join(str(part) for part in key)
             self._table.setItem(row, 0, QTableWidgetItem(device_id_by_key.get(key, f"D{row + 1}")))
@@ -288,21 +295,23 @@ class WlDialog(QDialog):
             self._table.setItem(row, 2, QTableWidgetItem(width_text))
             self._table.setItem(row, 3, QTableWidgetItem(length_text))
             self._table.setItem(row, 4, QTableWidgetItem(str(vdd_by_device.get(key, 1.2))))
-            self._table.setItem(row, 5, QTableWidgetItem(str(threshold_constant_by_device.get(key, 40.0))))
-            self._table.setItem(row, 6, QTableWidgetItem(""))
-            self._table.setCellWidget(row, 7, self._make_choice_combo(["NMOS", "PMOS"], polarity_by_device.get(key, "NMOS")))
+            self._table.setItem(row, 5, QTableWidgetItem(str(high_vd_by_device.get(key, 1.2))))
+            self._table.setItem(row, 6, QTableWidgetItem(str(low_vd_by_device.get(key, 0.05))))
+            self._table.setItem(row, 7, QTableWidgetItem(str(threshold_constant_by_device.get(key, 40.0))))
+            self._table.setItem(row, 8, QTableWidgetItem(""))
+            self._table.setCellWidget(row, 9, self._make_choice_combo(["NMOS", "PMOS"], polarity_by_device.get(key, "NMOS")))
             direction_sign = current_direction_by_device.get(key)
             if direction_sign is None:
                 direction_sign = -1.0 if polarity_by_device.get(key, "NMOS") == "PMOS" else 1.0
-            self._table.setCellWidget(row, 8, self._make_choice_combo(["Positive", "Negative"], "Negative" if direction_sign < 0 else "Positive"))
+            self._table.setCellWidget(row, 10, self._make_choice_combo(["Positive", "Negative"], "Negative" if direction_sign < 0 else "Positive"))
             self._update_threshold_current_for_row(row)
 
         self._table.itemChanged.connect(self._on_item_changed)
         self._table.resizeColumnsToContents()
 
-        apply_button = QPushButton("Apply First W/L/VDD/Vt Const. To All")
+        apply_button = QPushButton("Apply First W/L/VDD/High/Low/Vt Const. To All")
         apply_button.clicked.connect(self.apply_first_row_to_all)
-        set_selected_wl_button = QPushButton("Set Selected W/L/VDD/Th. Const.")
+        set_selected_wl_button = QPushButton("Set Selected W/L/VDD/High/Low/Th. Const.")
         set_selected_wl_button.clicked.connect(self.set_selected_device_parameters)
         clear_button = QPushButton("Clear All W/L")
         clear_button.clicked.connect(self.clear_all_dimensions)
@@ -319,7 +328,7 @@ class WlDialog(QDialog):
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
 
-        wl_group = QGroupBox("W/L/VDD/Vt Const.")
+        wl_group = QGroupBox("W/L/VDD/High Vd/Low Vd/Vt Const.")
         wl_layout = QHBoxLayout(wl_group)
         wl_layout.addWidget(apply_button)
         wl_layout.addWidget(set_selected_wl_button)
@@ -364,14 +373,18 @@ class WlDialog(QDialog):
         width = self._table.item(0, 2).text() if self._table.item(0, 2) else ""
         length = self._table.item(0, 3).text() if self._table.item(0, 3) else ""
         vdd = self._table.item(0, 4).text() if self._table.item(0, 4) else ""
-        threshold = self._table.item(0, 5).text() if self._table.item(0, 5) else ""
+        high_vd = self._table.item(0, 5).text() if self._table.item(0, 5) else ""
+        low_vd = self._table.item(0, 6).text() if self._table.item(0, 6) else ""
+        threshold = self._table.item(0, 7).text() if self._table.item(0, 7) else ""
         for row in range(1, self._table.rowCount()):
             self._table.setItem(row, 2, QTableWidgetItem(width))
             self._table.setItem(row, 3, QTableWidgetItem(length))
             self._table.setItem(row, 4, QTableWidgetItem(vdd))
-            self._table.setItem(row, 5, QTableWidgetItem(threshold))
+            self._table.setItem(row, 5, QTableWidgetItem(high_vd))
+            self._table.setItem(row, 6, QTableWidgetItem(low_vd))
+            self._table.setItem(row, 7, QTableWidgetItem(threshold))
 
-    def _prompt_device_parameters(self) -> tuple[float, float, float, float] | None:
+    def _prompt_device_parameters(self) -> tuple[float, float, float, float, float, float] | None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Set Device Parameters")
         layout = QFormLayout(dialog)
@@ -389,6 +402,16 @@ class WlDialog(QDialog):
         vdd_spin.setDecimals(6)
         vdd_spin.setValue(1.2)
 
+        high_vd_spin = QDoubleSpinBox(dialog)
+        high_vd_spin.setRange(-1_000_000.0, 1_000_000.0)
+        high_vd_spin.setDecimals(6)
+        high_vd_spin.setValue(1.2)
+
+        low_vd_spin = QDoubleSpinBox(dialog)
+        low_vd_spin.setRange(-1_000_000.0, 1_000_000.0)
+        low_vd_spin.setDecimals(6)
+        low_vd_spin.setValue(0.05)
+
         threshold_spin = QDoubleSpinBox(dialog)
         threshold_spin.setRange(0.0, 1_000_000.0)
         threshold_spin.setDecimals(6)
@@ -397,7 +420,9 @@ class WlDialog(QDialog):
         layout.addRow("Width (nm)", width_spin)
         layout.addRow("Length (nm)", length_spin)
         layout.addRow("Vdd target (V)", vdd_spin)
-        layout.addRow("Threshold constant (nA)", threshold_spin)
+        layout.addRow("High Vd (V)", high_vd_spin)
+        layout.addRow("Low Vd (V)", low_vd_spin)
+        layout.addRow("Vth Const. (nA)", threshold_spin)
 
         buttons = QHBoxLayout()
         ok_button = QPushButton("OK", dialog)
@@ -415,6 +440,8 @@ class WlDialog(QDialog):
             width_spin.value(),
             length_spin.value(),
             vdd_spin.value(),
+            high_vd_spin.value(),
+            low_vd_spin.value(),
             threshold_spin.value(),
         )
 
@@ -425,16 +452,20 @@ class WlDialog(QDialog):
         values = self._prompt_device_parameters()
         if values is None:
             return
-        width, length, vdd, threshold = values
+        width, length, vdd, high_vd, low_vd, threshold = values
         width_text = f"{width:g}"
         length_text = f"{length:g}"
         vdd_text = f"{vdd:g}"
+        high_vd_text = f"{high_vd:g}"
+        low_vd_text = f"{low_vd:g}"
         threshold_text = f"{threshold:g}"
         for row in selected_rows:
             self._table.setItem(row, 2, QTableWidgetItem(width_text))
             self._table.setItem(row, 3, QTableWidgetItem(length_text))
             self._table.setItem(row, 4, QTableWidgetItem(vdd_text))
-            self._table.setItem(row, 5, QTableWidgetItem(threshold_text))
+            self._table.setItem(row, 5, QTableWidgetItem(high_vd_text))
+            self._table.setItem(row, 6, QTableWidgetItem(low_vd_text))
+            self._table.setItem(row, 7, QTableWidgetItem(threshold_text))
 
     def clear_all_dimensions(self) -> None:
         for row in range(self._table.rowCount()):
@@ -446,7 +477,7 @@ class WlDialog(QDialog):
         if not selected_rows:
             selected_rows = list(range(self._table.rowCount()))
         for row in selected_rows:
-            combo = self._table.cellWidget(row, 7)
+            combo = self._table.cellWidget(row, 9)
             if isinstance(combo, QComboBox):
                 combo.setCurrentText(polarity)
 
@@ -456,18 +487,18 @@ class WlDialog(QDialog):
             selected_rows = list(range(self._table.rowCount()))
         label = "Negative" if sign < 0 else "Positive"
         for row in selected_rows:
-            combo = self._table.cellWidget(row, 8)
+            combo = self._table.cellWidget(row, 10)
             if isinstance(combo, QComboBox):
                 combo.setCurrentText(label)
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
-        if item.column() in (2, 3, 5):
+        if item.column() in (2, 3, 7):
             self._update_threshold_current_for_row(item.row())
 
     def _update_threshold_current_for_row(self, row: int) -> None:
         width_text = self._table.item(row, 2).text().strip() if self._table.item(row, 2) else ""
         length_text = self._table.item(row, 3).text().strip() if self._table.item(row, 3) else ""
-        threshold_text = self._table.item(row, 5).text().strip() if self._table.item(row, 5) else ""
+        threshold_text = self._table.item(row, 7).text().strip() if self._table.item(row, 7) else ""
         result_text = ""
         try:
             if width_text and length_text and threshold_text:
@@ -480,7 +511,7 @@ class WlDialog(QDialog):
             result_text = ""
 
         self._table.blockSignals(True)
-        self._table.setItem(row, 6, QTableWidgetItem(result_text))
+        self._table.setItem(row, 8, QTableWidgetItem(result_text))
         self._table.blockSignals(False)
 
     def values(self) -> dict[tuple[Any, ...], tuple[float, float]]:
@@ -503,10 +534,26 @@ class WlDialog(QDialog):
             result[key] = float(text) if text else 1.2
         return result
 
-    def threshold_constant_by_device(self) -> dict[tuple[Any, ...], float]:
+    def high_vd_by_device(self) -> dict[tuple[Any, ...], float]:
         result: dict[tuple[Any, ...], float] = {}
         for row, key in enumerate(self._device_keys):
             item = self._table.item(row, 5)
+            text = item.text().strip() if item else ""
+            result[key] = float(text) if text else 1.2
+        return result
+
+    def low_vd_by_device(self) -> dict[tuple[Any, ...], float]:
+        result: dict[tuple[Any, ...], float] = {}
+        for row, key in enumerate(self._device_keys):
+            item = self._table.item(row, 6)
+            text = item.text().strip() if item else ""
+            result[key] = float(text) if text else 0.05
+        return result
+
+    def threshold_constant_by_device(self) -> dict[tuple[Any, ...], float]:
+        result: dict[tuple[Any, ...], float] = {}
+        for row, key in enumerate(self._device_keys):
+            item = self._table.item(row, 7)
             text = item.text().strip() if item else ""
             result[key] = float(text) if text else 40.0
         return result
@@ -522,7 +569,7 @@ class WlDialog(QDialog):
     def polarity_by_device(self) -> dict[tuple[Any, ...], str]:
         result: dict[tuple[Any, ...], str] = {}
         for row, key in enumerate(self._device_keys):
-            combo = self._table.cellWidget(row, 7)
+            combo = self._table.cellWidget(row, 9)
             polarity = combo.currentText().strip().upper() if isinstance(combo, QComboBox) else "NMOS"
             result[key] = "PMOS" if polarity == "PMOS" else "NMOS"
         return result
@@ -530,7 +577,7 @@ class WlDialog(QDialog):
     def current_direction_by_device(self) -> dict[tuple[Any, ...], float]:
         result: dict[tuple[Any, ...], float] = {}
         for row, key in enumerate(self._device_keys):
-            combo = self._table.cellWidget(row, 8)
+            combo = self._table.cellWidget(row, 10)
             direction = combo.currentText().strip().lower() if isinstance(combo, QComboBox) else "positive"
             result[key] = -1.0 if direction.startswith("neg") else 1.0
         return result
@@ -546,7 +593,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("MOSx Parameter Calculator")
-        self.resize(1500, 820)
+        self.resize(1280, 820)
 
         self.dataframe = pd.DataFrame()
         self.preview_model = DataFrameModel()
@@ -557,6 +604,8 @@ class MainWindow(QMainWindow):
         self.device_current_direction_by_key: dict[tuple[Any, ...], float] = {}
         self.device_id_by_key: dict[tuple[Any, ...], str] = {}
         self.device_vdd_by_key: dict[tuple[Any, ...], float] = {}
+        self.device_high_vd_by_key: dict[tuple[Any, ...], float] = {}
+        self.device_low_vd_by_key: dict[tuple[Any, ...], float] = {}
         self.device_threshold_constant_by_key: dict[tuple[Any, ...], float] = {}
         self.results_by_key: dict[tuple[Any, ...], DeviceResult] = {}
         self.results_frame = pd.DataFrame()
@@ -711,12 +760,8 @@ class MainWindow(QMainWindow):
         config_layout.addStretch(1)
 
         splitter.addWidget(config_panel)
-
-        right_splitter = QSplitter(Qt.Vertical)
-        splitter.addWidget(right_splitter)
-        splitter.setSizes([450, 1150])
-
-        right_panel = QTabWidget()
+        splitter.addWidget(right_panel := QTabWidget())
+        splitter.setSizes([450, 780])
         preview_tab = QWidget()
         preview_layout = QVBoxLayout(preview_tab)
         self.preview_table = QTableView()
@@ -747,21 +792,88 @@ class MainWindow(QMainWindow):
         plot_tab_layout = QVBoxLayout(plot_tab)
 
         plot_controls = QGroupBox("Plot Settings")
-        plot_controls_layout = QFormLayout(plot_controls)
+        plot_controls_layout = QVBoxLayout(plot_controls)
+        plot_controls_layout.setContentsMargins(8, 8, 8, 8)
+        plot_controls_layout.setSpacing(6)
         self.plot_device_combo = QComboBox()
         self.plot_vd_both_radio = QRadioButton("Both Vd")
-        self.plot_vd_high_radio = QRadioButton("High Vd")
-        self.plot_vd_low_radio = QRadioButton("Low Vd")
+        self.plot_vd_high_radio = QRadioButton("Sat Vd")
+        self.plot_vd_low_radio = QRadioButton("Lin Vd")
+        self.plot_vd_both_radio.setChecked(True)
         self.plot_abs_log_checkbox = QCheckBox("log10(|Y|)")
-        plot_controls_layout.addRow("Device", self.plot_device_combo)
-        plot_controls_layout.addRow(
-            "Vd selection",
-            _row_widget(self.plot_vd_both_radio, self.plot_vd_high_radio, self.plot_vd_low_radio),
-        )
-        plot_controls_layout.addRow("Y axis", self.plot_abs_log_checkbox)
-        self.plot_button = QPushButton("Plot Selected Device")
-        self.plot_button.clicked.connect(self.plot_selected_device)
-        plot_controls_layout.addRow("", self.plot_button)
+        device_row = QWidget()
+        device_layout = QHBoxLayout(device_row)
+        device_layout.setContentsMargins(0, 0, 0, 0)
+        device_layout.setSpacing(8)
+        device_layout.addWidget(QLabel("Device"))
+        device_layout.addWidget(self.plot_device_combo, 1)
+        self.plot_prev_button = QPushButton("Prev")
+        self.plot_prev_button.clicked.connect(lambda: self._step_plot_device(-1))
+        device_layout.addWidget(self.plot_prev_button)
+        self.plot_next_button = QPushButton("Next")
+        self.plot_next_button.clicked.connect(lambda: self._step_plot_device(1))
+        device_layout.addWidget(self.plot_next_button)
+        plot_controls_layout.addWidget(device_row)
+
+        options_row = QWidget()
+        options_layout = QHBoxLayout(options_row)
+        options_layout.setContentsMargins(0, 0, 0, 0)
+        options_layout.setSpacing(8)
+        options_layout.addWidget(QLabel("Vd selection"))
+        options_layout.addWidget(self.plot_vd_both_radio)
+        options_layout.addWidget(self.plot_vd_high_radio)
+        options_layout.addWidget(self.plot_vd_low_radio)
+        options_layout.addSpacing(16)
+        options_layout.addWidget(QLabel("Y axis"))
+        options_layout.addWidget(self.plot_abs_log_checkbox)
+        options_layout.addStretch(1)
+        plot_controls_layout.addWidget(options_row)
+
+        sg_row = QWidget()
+        sg_layout = QHBoxLayout(sg_row)
+        sg_layout.setContentsMargins(0, 0, 0, 0)
+        sg_layout.setSpacing(8)
+        sg_layout.addWidget(QLabel("SG window"))
+        self.sg_window_spin = QSpinBox()
+        self.sg_window_spin.setRange(5, 101)
+        self.sg_window_spin.setSingleStep(2)
+        self.sg_window_spin.setValue(11)
+        sg_layout.addWidget(self.sg_window_spin)
+        sg_layout.addWidget(QLabel("SG polyorder"))
+        self.sg_polyorder_spin = QSpinBox()
+        self.sg_polyorder_spin.setRange(1, 7)
+        self.sg_polyorder_spin.setValue(3)
+        sg_layout.addWidget(self.sg_polyorder_spin)
+        self.vtgm_viewer_button = QPushButton("Vtgm Viewer")
+        self.vtgm_viewer_button.setCheckable(True)
+        self.vtgm_viewer_button.setChecked(False)
+        self.vtgm_viewer_button.toggled.connect(self._toggle_vtgm_viewer)
+        sg_layout.addWidget(self.vtgm_viewer_button)
+        sg_layout.addStretch(1)
+        plot_controls_layout.addWidget(sg_row)
+
+        self.vtgm_viewer_group = QGroupBox("Vtgm Viewer")
+        vtgm_viewer_layout = QFormLayout(self.vtgm_viewer_group)
+        self.vtgm_viewer_mode_label = QLabel("-")
+        self.vtgm_viewer_value_label = QLabel("-")
+        self.vtgm_viewer_point_label = QLabel("-")
+        self.vtgm_viewer_gm_label = QLabel("-")
+        self.vtgm_viewer_intercept_label = QLabel("-")
+        for label in [
+            self.vtgm_viewer_mode_label,
+            self.vtgm_viewer_value_label,
+            self.vtgm_viewer_point_label,
+            self.vtgm_viewer_gm_label,
+            self.vtgm_viewer_intercept_label,
+        ]:
+            label.setTextFormat(Qt.PlainText)
+            label.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
+        vtgm_viewer_layout.addRow("Curve", self.vtgm_viewer_mode_label)
+        vtgm_viewer_layout.addRow("Vtgm", self.vtgm_viewer_value_label)
+        vtgm_viewer_layout.addRow("Selected point", self.vtgm_viewer_point_label)
+        vtgm_viewer_layout.addRow("gm", self.vtgm_viewer_gm_label)
+        vtgm_viewer_layout.addRow("X intercept", self.vtgm_viewer_intercept_label)
+        plot_controls_layout.addWidget(self.vtgm_viewer_group)
 
         plot_controls.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         plot_controls.setMaximumHeight(plot_controls.sizeHint().height())
@@ -772,13 +884,12 @@ class MainWindow(QMainWindow):
         self.canvas.customContextMenuRequested.connect(self.open_plot_context_menu)
         plot_tab_layout.addWidget(self.canvas, 1)
         right_panel.addTab(plot_tab, "Plot")
-        right_splitter.addWidget(right_panel)
 
         self.status_text = QTextEdit()
         self.status_text.setReadOnly(True)
         self.status_text.setPlaceholderText("Imported file info, validation messages, and calculation notes will appear here.")
-        right_splitter.addWidget(self.status_text)
-        right_splitter.setSizes([760, 210])
+        self.status_text.setMaximumHeight(170)
+        root_layout.addWidget(self.status_text)
 
         self.curve_type_column_combo.currentTextChanged.connect(self.refresh_curve_value_choices)
         self.drain_bias_column_combo.currentTextChanged.connect(self.refresh_bias_value_choices)
@@ -788,8 +899,12 @@ class MainWindow(QMainWindow):
         self.plot_vd_high_radio.toggled.connect(self.plot_selected_device)
         self.plot_vd_low_radio.toggled.connect(self.plot_selected_device)
         self.plot_abs_log_checkbox.toggled.connect(self.plot_selected_device)
+        self.plot_device_combo.currentTextChanged.connect(self.plot_selected_device)
+        self.sg_window_spin.valueChanged.connect(self._on_sg_settings_changed)
+        self.sg_polyorder_spin.valueChanged.connect(self._on_sg_settings_changed)
         self._update_curve_mode_ui()
         self._update_bias_mode_ui()
+        self._toggle_vtgm_viewer(False)
 
     def _apply_plot_defaults(self) -> None:
         self.canvas.figure.set_facecolor("#ffffff")
@@ -803,6 +918,137 @@ class MainWindow(QMainWindow):
                 spine.set_color("#000000")
             ax.grid(True, color="#d0d0d0", alpha=0.4)
         self.canvas.draw_idle()
+
+    def _on_sg_settings_changed(self) -> None:
+        window = self.sg_window_spin.value()
+        if window % 2 == 0:
+            self.sg_window_spin.blockSignals(True)
+            self.sg_window_spin.setValue(window + 1)
+            self.sg_window_spin.blockSignals(False)
+            return
+        max_poly = max(1, window - 1)
+        if self.sg_polyorder_spin.value() > max_poly:
+            self.sg_polyorder_spin.blockSignals(True)
+            self.sg_polyorder_spin.setValue(max_poly)
+            self.sg_polyorder_spin.blockSignals(False)
+        if not self.results_frame.empty and not self.dataframe.empty:
+            error = self.validate_config()
+            if error is None:
+                self.calculate_results()
+                return
+        self.plot_selected_device()
+
+    def _toggle_vtgm_viewer(self, checked: bool) -> None:
+        self.vtgm_viewer_group.setVisible(checked)
+
+    def _step_plot_device(self, step: int) -> None:
+        count = self.plot_device_combo.count()
+        if count <= 0:
+            return
+        current_index = self.plot_device_combo.currentIndex()
+        if current_index < 0:
+            current_index = 0
+        next_index = (current_index + step) % count
+        self.plot_device_combo.setCurrentIndex(next_index)
+        self.plot_selected_device()
+
+    def _fmt_viewer(self, value: float | None, unit: str = "") -> str:
+        if value is None or pd.isna(value):
+            return "-"
+        number = float(value)
+        if math.isclose(number, 0.0, abs_tol=1e-15):
+            text = "0.000"
+        elif abs(number) >= 1e4 or abs(number) < 1e-2:
+            text = f"{number:.3e}"
+        else:
+            text = f"{number:.3f}"
+        return f"{text} {unit}".rstrip()
+
+    def _format_sat_lin_pair(self, sat_text: str, lin_text: str, sat_width: int) -> str:
+        return f"{sat_text.ljust(max(sat_width, 1))} | {lin_text}"
+
+    def _set_vtgm_viewer_details(self, title: str, value_v: float | None, details: dict[str, Any] | None) -> None:
+        self.vtgm_viewer_mode_label.setText(title)
+        self.vtgm_viewer_value_label.setText(self._fmt_viewer(value_v, "V") if value_v is not None else "-")
+        if not details:
+            self.vtgm_viewer_point_label.setText("-")
+            self.vtgm_viewer_gm_label.setText("-")
+            self.vtgm_viewer_intercept_label.setText("-")
+            return
+        vg_v = details.get("vg_v")
+        original_id_a = details.get("original_id_a")
+        gm_a_per_v = details.get("gm_a_per_v")
+        x_intercept_v = details.get("x_intercept_v")
+        point_text = "-"
+        if vg_v is not None and original_id_a is not None:
+            point_text = f"Vg = {self._fmt_viewer(vg_v, 'V')}, Id = {self._fmt_viewer(original_id_a, 'A')}"
+        self.vtgm_viewer_point_label.setText(point_text)
+        self.vtgm_viewer_gm_label.setText(self._fmt_viewer(gm_a_per_v, "A/V") if gm_a_per_v is not None else "-")
+        self.vtgm_viewer_intercept_label.setText(self._fmt_viewer(x_intercept_v, "V") if x_intercept_v is not None else "-")
+
+    def _update_vtgm_viewer(self, result: DeviceResult | None) -> None:
+        if result is None:
+            self._set_vtgm_viewer_details("-", None, None)
+            return
+        if self.plot_vd_high_radio.isChecked():
+            self._set_vtgm_viewer_details("Sat Vd", result.vtgm_sat_v, result.details.get("vtgm_sat"))
+            return
+        if self.plot_vd_low_radio.isChecked():
+            self._set_vtgm_viewer_details("Lin Vd", result.vtgm_lin_v, result.details.get("vtgm_lin"))
+            return
+        sat_text = f"Sat: {self._fmt_viewer(result.vtgm_sat_v, 'V')}" if result.vtgm_sat_v is not None else "Sat=-"
+        lin_text = f"Lin: {self._fmt_viewer(result.vtgm_lin_v, 'V')}" if result.vtgm_lin_v is not None else "Lin=-"
+        self.vtgm_viewer_mode_label.setText("Both Vd")
+        pair_rows: list[tuple[str, str]] = [(sat_text, lin_text)]
+        sat_details = result.details.get("vtgm_sat")
+        lin_details = result.details.get("vtgm_lin")
+        point_sat = "Sat=-"
+        point_lin = "Lin=-"
+        gm_sat = "Sat=-"
+        gm_lin = "Lin=-"
+        intercept_sat = "Sat=-"
+        intercept_lin = "Lin=-"
+        if sat_details:
+            point_sat = (
+                f"Sat: Vg = {self._fmt_viewer(sat_details.get('vg_v'), 'V')}, "
+                f"Id = {self._fmt_viewer(sat_details.get('original_id_a'), 'A')}"
+            )
+            gm_sat = f"Sat: {self._fmt_viewer(sat_details.get('gm_a_per_v'), 'A/V')}"
+            intercept_sat = f"Sat: {self._fmt_viewer(sat_details.get('x_intercept_v'), 'V')}"
+        if lin_details:
+            point_lin = (
+                f"Lin: Vg = {self._fmt_viewer(lin_details.get('vg_v'), 'V')}, "
+                f"Id = {self._fmt_viewer(lin_details.get('original_id_a'), 'A')}"
+            )
+            gm_lin = f"Lin: {self._fmt_viewer(lin_details.get('gm_a_per_v'), 'A/V')}"
+            intercept_lin = f"Lin: {self._fmt_viewer(lin_details.get('x_intercept_v'), 'V')}"
+        pair_rows.extend(
+            [
+                (point_sat, point_lin),
+                (gm_sat, gm_lin),
+                (intercept_sat, intercept_lin),
+            ]
+        )
+        sat_width = max(len(left) for left, _ in pair_rows)
+        self.vtgm_viewer_value_label.setText(self._format_sat_lin_pair(sat_text, lin_text, sat_width))
+        self.vtgm_viewer_point_label.setText(self._format_sat_lin_pair(point_sat, point_lin, sat_width))
+        self.vtgm_viewer_gm_label.setText(self._format_sat_lin_pair(gm_sat, gm_lin, sat_width))
+        self.vtgm_viewer_intercept_label.setText(self._format_sat_lin_pair(intercept_sat, intercept_lin, sat_width))
+
+    def _current_savgol_settings(self, point_count: int) -> tuple[int, int]:
+        window_length = self.sg_window_spin.value() if hasattr(self, "sg_window_spin") else 11
+        polyorder = self.sg_polyorder_spin.value() if hasattr(self, "sg_polyorder_spin") else 3
+        if window_length % 2 == 0:
+            window_length += 1
+        if point_count % 2 == 0:
+            point_limit = point_count - 1
+        else:
+            point_limit = point_count
+        window_length = min(window_length, point_limit)
+        if window_length < 3:
+            return 0, polyorder
+        polyorder = min(polyorder, window_length - 1)
+        return window_length, polyorder
 
     def _update_curve_mode_ui(self) -> None:
         # 0 = needs curve type column, 1 = IdVg-only
@@ -934,6 +1180,8 @@ class MainWindow(QMainWindow):
             self.device_dimensions,
             self.device_id_by_key,
             self.device_vdd_by_key,
+            self.device_high_vd_by_key,
+            self.device_low_vd_by_key,
             self.device_threshold_constant_by_key,
             self.device_polarity_by_key,
             self.device_current_direction_by_key,
@@ -947,11 +1195,15 @@ class MainWindow(QMainWindow):
                 return
             self.device_id_by_key = dialog.device_id_by_device()
             self.device_vdd_by_key = dialog.vdd_by_device()
+            self.device_high_vd_by_key = dialog.high_vd_by_device()
+            self.device_low_vd_by_key = dialog.low_vd_by_device()
             self.device_threshold_constant_by_key = dialog.threshold_constant_by_device()
             self.device_polarity_by_key = dialog.polarity_by_device()
             self.device_current_direction_by_key = dialog.current_direction_by_device()
             self.log(f"Saved device IDs for {len(self.device_id_by_key)} devices.")
             self.log(f"Saved Vdd target for {len(self.device_vdd_by_key)} devices.")
+            self.log(f"Saved High Vd for {len(self.device_high_vd_by_key)} devices.")
+            self.log(f"Saved Low Vd for {len(self.device_low_vd_by_key)} devices.")
             self.log(f"Saved threshold constant for {len(self.device_threshold_constant_by_key)} devices.")
             self.log(f"Saved Width / Length for {len(self.device_dimensions)} devices.")
             self.log(f"Saved polarity for {len(self.device_polarity_by_key)} devices.")
@@ -1127,7 +1379,7 @@ class MainWindow(QMainWindow):
                 continue
 
             high_curve, low_curve = self._extract_idvg_curves(device_frame, config, vg_scale, id_scale)
-            results.append(self._calculate_device(device_key, high_curve, low_curve, width_nm, length_nm, config))
+            results.append(self._calculate_device(device_key, high_curve, low_curve, width_nm, length_nm))
 
         if not results:
             info_message("No valid devices were calculated. Please check your mappings and numeric columns.")
@@ -1158,7 +1410,7 @@ class MainWindow(QMainWindow):
         self.device_lookup_model.set_frame(self.device_lookup_frame)
         self.log(
             "Calculation settings: "
-            "Per-device Vdd / threshold constant / current direction applied."
+            "Per-device Vdd / High Vd / Low Vd / Vth constant / current direction applied."
         )
         self.log(f"Calculated {len(results)} devices.")
         self.refresh_plot_devices()
@@ -1196,7 +1448,6 @@ class MainWindow(QMainWindow):
         low_frame: pd.DataFrame,
         width_nm: float,
         length_nm: float,
-        config: dict[str, Any],
     ) -> DeviceResult:
         polarity = self.device_polarity_by_key.get(device_key, "NMOS")
         current_direction_sign = self.device_current_direction_by_key.get(
@@ -1204,18 +1455,18 @@ class MainWindow(QMainWindow):
             -1.0 if polarity == "PMOS" else 1.0,
         )
         vdd_target_v = self.device_vdd_by_key.get(device_key, 1.2)
+        high_vd_v = self.device_high_vd_by_key.get(device_key, 1.2)
+        low_vd_v = self.device_low_vd_by_key.get(device_key, 0.05)
         threshold_constant_na = self.device_threshold_constant_by_key.get(device_key, 40.0)
-        vg_vdd_target_v = abs(vdd_target_v)
-
         idoff_row = self._closest_row(high_frame, target=0.0, column="_vg_v")
-        ids_row = self._closest_abs_row(high_frame, target=vg_vdd_target_v, column="_vg_v")
-        idl_row = self._closest_abs_row(low_frame, target=vg_vdd_target_v, column="_vg_v")
+        ids_row = self._closest_abs_row(high_frame, target=abs(vdd_target_v), column="_vg_v")
+        idl_row = self._closest_abs_row(low_frame, target=abs(vdd_target_v), column="_vg_v")
 
         target_current_a = current_direction_sign * threshold_constant_na * 1e-9 * (width_nm / length_nm)
         vts, vts_details = self._interpolate_vg_for_current(high_frame, target_current_a)
         vtl, vtl_details = self._interpolate_vg_for_current(low_frame, target_current_a)
-        vtgm_sat, vtgm_sat_details = self._calculate_vtgm(high_frame)
-        vtgm_lin, vtgm_lin_details = self._calculate_vtgm(low_frame)
+        vtgm_sat, vtgm_sat_details = self._calculate_vtgm(high_frame, high_vd_v, polarity)
+        vtgm_lin, vtgm_lin_details = self._calculate_vtgm(low_frame, low_vd_v, polarity)
 
         idoff_pa = self._current_display_value(idoff_row, 1e12)
         ids_ua = self._current_display_value(ids_row, 1e6)
@@ -1237,6 +1488,8 @@ class MainWindow(QMainWindow):
             "vtgm_lin": vtgm_lin_details,
             "target_current_a": target_current_a,
             "vdd_target_v": vdd_target_v,
+            "high_vd_v": high_vd_v,
+            "low_vd_v": low_vd_v,
             "threshold_constant_na": threshold_constant_na,
             "current_direction_sign": current_direction_sign,
             "polarity": polarity,
@@ -1315,58 +1568,141 @@ class MainWindow(QMainWindow):
         vg = left["_vg_v"] + ratio * (right["_vg_v"] - left["_vg_v"])
         return float(vg), {"method": "nearest-interpolated", "left": left, "right": right}
 
-    def _calculate_vtgm(self, frame: pd.DataFrame) -> tuple[float | None, dict[str, Any] | None]:
-        if len(frame) < 2:
+    def _savgol_window_length(self, point_count: int) -> int:
+        window_length, _ = self._current_savgol_settings(point_count)
+        return window_length
+
+    def _savgol_smooth_and_derivative(
+        self,
+        x_values: np.ndarray,
+        y_values: np.ndarray,
+        window_length: int | None = None,
+        polyorder: int = 3,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        point_count = len(x_values)
+        if point_count < 3:
+            return y_values.copy(), np.full(point_count, np.nan, dtype=float)
+
+        if window_length is None:
+            window_length, polyorder = self._current_savgol_settings(point_count)
+        if window_length <= 0:
+            return y_values.copy(), np.full(point_count, np.nan, dtype=float)
+
+        window_length = min(window_length, point_count if point_count % 2 == 1 else point_count - 1)
+        if window_length < 3:
+            return y_values.copy(), np.full(point_count, np.nan, dtype=float)
+
+        polyorder = min(polyorder, window_length - 1)
+        half_window = window_length // 2
+        smoothed = np.empty(point_count, dtype=float)
+        derivative = np.empty(point_count, dtype=float)
+
+        for index in range(point_count):
+            start = max(0, index - half_window)
+            stop = min(point_count, index + half_window + 1)
+            while stop - start < window_length:
+                if start > 0:
+                    start -= 1
+                elif stop < point_count:
+                    stop += 1
+                else:
+                    break
+
+            local_x = x_values[start:stop] - x_values[index]
+            local_y = y_values[start:stop]
+            effective_order = min(polyorder, len(local_x) - 1)
+            if len(local_x) <= effective_order:
+                smoothed[index] = y_values[index]
+                derivative[index] = np.nan
+                continue
+
+            coefficients = np.polyfit(local_x, local_y, effective_order)
+            smoothed[index] = np.polyval(coefficients, 0.0)
+            derivative_coefficients = np.polyder(coefficients)
+            derivative[index] = np.polyval(derivative_coefficients, 0.0) if len(derivative_coefficients) else 0.0
+
+        return smoothed, derivative
+
+    def _calculate_vtgm(
+        self,
+        frame: pd.DataFrame,
+        drain_bias_v: float,
+        polarity: str,
+    ) -> tuple[float | None, dict[str, Any] | None]:
+        if len(frame) < 3:
             return None, None
 
         work = frame[["_vg_v", "_id_a"]].dropna().sort_values("_vg_v")
-        if len(work) < 2:
+        if len(work) < 3:
             return None, None
 
-        candidates: list[dict[str, Any]] = []
-        values = work.to_dict("records")
-        for left, right in zip(values, values[1:]):
-            delta_vg = right["_vg_v"] - left["_vg_v"]
-            if math.isclose(delta_vg, 0.0):
-                continue
-            slope = (right["_id_a"] - left["_id_a"]) / delta_vg
-            candidates.append(
-                {
-                    "left": left,
-                    "right": right,
-                    "slope_a_per_v": slope,
-                    "vtgm_v": (left["_vg_v"] + right["_vg_v"]) / 2,
-                }
-            )
-
-        if not candidates:
+        x_values = work["_vg_v"].to_numpy(dtype=float)
+        y_values = work["_id_a"].to_numpy(dtype=float)
+        window_length, polyorder = self._current_savgol_settings(len(x_values))
+        smoothed_y, smoothed_gm = self._savgol_smooth_and_derivative(
+            x_values,
+            y_values,
+            window_length=window_length,
+            polyorder=polyorder,
+        )
+        valid_mask = np.isfinite(smoothed_gm) & ~np.isclose(smoothed_gm, 0.0)
+        if not valid_mask.any():
             return None, None
 
-        best = max(candidates, key=lambda item: abs(item["slope_a_per_v"]))
-        return float(best["vtgm_v"]), best
+        valid_indices = np.flatnonzero(valid_mask)
+        best_index = int(valid_indices[np.argmax(np.abs(smoothed_gm[valid_mask]))])
+        x0 = float(x_values[best_index])
+        y0 = float(smoothed_y[best_index])
+        original_y0 = float(y_values[best_index])
+        gm0 = float(smoothed_gm[best_index])
+        x_intercept = x0 - (y0 / gm0)
+        vtgm_magnitude = abs(x_intercept) - abs(drain_bias_v) / 2.0
+        vtgm_value = -vtgm_magnitude if str(polarity).upper() == "PMOS" else vtgm_magnitude
+
+        details = {
+            "method": "savgol-tangent",
+            "vg_v": x0,
+            "id_a": y0,
+            "original_id_a": original_y0,
+            "gm_a_per_v": gm0,
+            "x_intercept_v": x_intercept,
+            "drain_bias_v": drain_bias_v,
+            "vtgm_v": vtgm_value,
+            "window_length": window_length,
+            "polyorder": polyorder,
+        }
+        return float(vtgm_value), details
 
     def _curve_derivative_series(
         self,
         curve: pd.DataFrame,
         y_scale: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if len(curve) < 2:
-            return np.array([]), np.array([])
+            return np.array([]), np.array([]), np.array([]), np.array([])
 
         work = curve[["_vg_v", "_id_a"]].dropna().sort_values("_vg_v").copy()
         if len(work) < 2:
-            return np.array([]), np.array([])
+            return np.array([]), np.array([]), np.array([]), np.array([])
 
         x_values = work["_vg_v"].to_numpy(dtype=float)
         y_values = (work["_id_a"] * y_scale).to_numpy(dtype=float)
         delta_x = np.diff(x_values)
         valid = ~np.isclose(delta_x, 0.0)
         if not valid.any():
-            return np.array([]), np.array([])
+            return np.array([]), np.array([]), np.array([]), np.array([])
 
         mid_x = (x_values[:-1] + x_values[1:]) / 2
         slopes = np.diff(y_values) / delta_x
-        return mid_x[valid], slopes[valid]
+        window_length, polyorder = self._current_savgol_settings(len(x_values))
+        smooth_y, smooth_slopes = self._savgol_smooth_and_derivative(
+            x_values,
+            y_values,
+            window_length=window_length,
+            polyorder=polyorder,
+        )
+        smooth_valid = np.isfinite(smooth_slopes)
+        return mid_x[valid], slopes[valid], x_values[smooth_valid], smooth_slopes[smooth_valid]
 
     def _fmt(self, value: float | None) -> str:
         return "" if value is None or pd.isna(value) else f"{value:.6g}"
@@ -1395,6 +1731,7 @@ class MainWindow(QMainWindow):
     def plot_selected_device(self) -> None:
         self.canvas.figure.clear()
         if not self.results_by_key:
+            self._update_vtgm_viewer(None)
             self._apply_plot_defaults()
             self.canvas.draw()
             return
@@ -1402,9 +1739,11 @@ class MainWindow(QMainWindow):
         selected_name = self.plot_device_combo.currentText()
         result = next((item for item in self.results_by_key.values() if item.device_id == selected_name), None)
         if result is None:
+            self._update_vtgm_viewer(None)
             self._apply_plot_defaults()
             self.canvas.draw()
             return
+        self._update_vtgm_viewer(result)
 
         config = self._config()
         if not config["gate_voltage_unit"] or not config["drain_current_unit"]:
@@ -1451,7 +1790,7 @@ class MainWindow(QMainWindow):
         gm_ax = ax.twinx()
         gm_plotted = False
 
-        def plot_curve(ax, curve: pd.DataFrame, label: str) -> bool:
+        def plot_curve(ax, curve: pd.DataFrame, label: str, vtgm_details: dict[str, Any] | None = None) -> bool:
             nonlocal gm_plotted
             if curve.empty:
                 return False
@@ -1473,10 +1812,34 @@ class MainWindow(QMainWindow):
                 linewidth=1.2,
                 label=label,
             )
+            line_color = ax.lines[-1].get_color()
+            if vtgm_details and vtgm_details.get("vg_v") is not None and vtgm_details.get("original_id_a") is not None:
+                highlight_y = float(vtgm_details["original_id_a"]) * y_scale
+                if use_abs_log:
+                    highlight_y = abs(highlight_y)
+                    if highlight_y > 0:
+                        ax.plot(
+                            [float(vtgm_details["vg_v"])],
+                            [highlight_y],
+                            marker="o",
+                            markersize=5,
+                            color="red",
+                            linestyle="None",
+                            zorder=6,
+                        )
+                else:
+                    ax.plot(
+                        [float(vtgm_details["vg_v"])],
+                        [highlight_y],
+                        marker="o",
+                        markersize=5,
+                        color="red",
+                        linestyle="None",
+                        zorder=6,
+                    )
 
-            derivative_x, derivative_y = self._curve_derivative_series(curve, y_scale)
+            derivative_x, derivative_y, smooth_gm_x, smooth_gm_y = self._curve_derivative_series(curve, y_scale)
             if len(derivative_x) > 0:
-                line_color = ax.lines[-1].get_color()
                 gm_ax.plot(
                     derivative_x,
                     derivative_y,
@@ -1487,22 +1850,33 @@ class MainWindow(QMainWindow):
                     label=f"{label} dId/dVg",
                 )
                 gm_plotted = True
+            if len(smooth_gm_x) > 0:
+                gm_ax.plot(
+                    smooth_gm_x,
+                    smooth_gm_y,
+                    linestyle="-",
+                    linewidth=0.9,
+                    color="#000000",
+                    alpha=0.95,
+                    label=f"{label} dId/dVg (SG)",
+                )
+                gm_plotted = True
             return True
 
-        high_label = f"High Vd: {config['high_bias_value']}" if config["bias_mode"] == "by_column" else "High Vd"
-        low_label = f"Low Vd: {config['low_bias_value']}" if config["bias_mode"] == "by_column" else "Low Vd"
+        high_label = f"Sat Vd: {config['high_bias_value']}" if config["bias_mode"] == "by_column" else "Sat Vd"
+        low_label = f"Lin Vd: {config['low_bias_value']}" if config["bias_mode"] == "by_column" else "Lin Vd"
 
         plotted = False
         if self.plot_vd_both_radio.isChecked():
-            plotted |= plot_curve(ax, high_curve, high_label)
-            plotted |= plot_curve(ax, low_curve, low_label)
-            mode_title = "High + Low Vd"
+            plotted |= plot_curve(ax, high_curve, high_label, result.details.get("vtgm_sat"))
+            plotted |= plot_curve(ax, low_curve, low_label, result.details.get("vtgm_lin"))
+            mode_title = "Sat + Lin Vd"
         elif self.plot_vd_high_radio.isChecked():
-            plotted |= plot_curve(ax, high_curve, high_label)
-            mode_title = "High Vd"
+            plotted |= plot_curve(ax, high_curve, high_label, result.details.get("vtgm_sat"))
+            mode_title = "Sat Vd"
         elif self.plot_vd_low_radio.isChecked():
-            plotted |= plot_curve(ax, low_curve, low_label)
-            mode_title = "Low Vd"
+            plotted |= plot_curve(ax, low_curve, low_label, result.details.get("vtgm_lin"))
+            mode_title = "Lin Vd"
         else:
             mode_title = "No Vd Selection"
 
