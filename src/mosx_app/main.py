@@ -756,12 +756,16 @@ class MainWindow(QMainWindow):
         unit_layout.setColumnStretch(3, 1)
         mapping_layout.addRow(unit_row)
         config_layout.addWidget(mapping_group)
-
-        config_layout.addStretch(1)
+        self.status_text = QTextEdit()
+        self.status_text.setReadOnly(True)
+        self.status_text.setPlaceholderText("Imported file info, validation messages, and calculation notes will appear here.")
+        self.status_text.setMinimumHeight(170)
+        self.status_text.setMaximumHeight(220)
+        config_layout.addWidget(self.status_text, 1)
 
         splitter.addWidget(config_panel)
         splitter.addWidget(right_panel := QTabWidget())
-        splitter.setSizes([450, 780])
+        splitter.setSizes([470, 830])
         preview_tab = QWidget()
         preview_layout = QVBoxLayout(preview_tab)
         self.preview_table = QTableView()
@@ -885,12 +889,6 @@ class MainWindow(QMainWindow):
         plot_tab_layout.addWidget(self.canvas, 1)
         right_panel.addTab(plot_tab, "Plot")
 
-        self.status_text = QTextEdit()
-        self.status_text.setReadOnly(True)
-        self.status_text.setPlaceholderText("Imported file info, validation messages, and calculation notes will appear here.")
-        self.status_text.setMaximumHeight(170)
-        root_layout.addWidget(self.status_text)
-
         self.curve_type_column_combo.currentTextChanged.connect(self.refresh_curve_value_choices)
         self.drain_bias_column_combo.currentTextChanged.connect(self.refresh_bias_value_choices)
         self.curve_mode_with_type_radio.toggled.connect(self._update_curve_mode_ui)
@@ -904,6 +902,7 @@ class MainWindow(QMainWindow):
         self.sg_polyorder_spin.valueChanged.connect(self._on_sg_settings_changed)
         self._update_curve_mode_ui()
         self._update_bias_mode_ui()
+        self.vtgm_viewer_group.setVisible(True)
         self._toggle_vtgm_viewer(False)
 
     def _apply_plot_defaults(self) -> None:
@@ -939,7 +938,9 @@ class MainWindow(QMainWindow):
         self.plot_selected_device()
 
     def _toggle_vtgm_viewer(self, checked: bool) -> None:
-        self.vtgm_viewer_group.setVisible(checked)
+        if not checked:
+            self._update_vtgm_viewer(None)
+        self.plot_selected_device()
 
     def _step_plot_device(self, step: int) -> None:
         count = self.plot_device_combo.count()
@@ -987,6 +988,9 @@ class MainWindow(QMainWindow):
         self.vtgm_viewer_intercept_label.setText(self._fmt_viewer(x_intercept_v, "V") if x_intercept_v is not None else "-")
 
     def _update_vtgm_viewer(self, result: DeviceResult | None) -> None:
+        if not self.vtgm_viewer_button.isChecked():
+            self._set_vtgm_viewer_details("-", None, None)
+            return
         if result is None:
             self._set_vtgm_viewer_details("-", None, None)
             return
@@ -1076,7 +1080,14 @@ class MainWindow(QMainWindow):
             self.log("Qt color scheme override API is not available in this PySide6/Qt build.")
 
     def log(self, text: str) -> None:
-        self.status_text.append(text)
+        lines = str(text).splitlines() or [""]
+        formatted_lines = []
+        for index, line in enumerate(lines):
+            prefix = "> " if index == 0 else "  "
+            formatted_lines.append(f"{prefix}{line}")
+        if self.status_text.toPlainText():
+            self.status_text.append("")
+        self.status_text.append("\n".join(formatted_lines))
 
     def import_csv(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV Files (*.csv);;All Files (*.*)")
@@ -1785,9 +1796,10 @@ class MainWindow(QMainWindow):
         y_unit = config["drain_current_unit"]
         y_scale = 1.0 / CURRENT_UNITS_TO_AMP[y_unit]
         use_abs_log = self.plot_abs_log_checkbox.isChecked()
+        show_vtgm_overlay = self.vtgm_viewer_button.isChecked()
 
         ax = self.canvas.figure.add_subplot(111)
-        gm_ax = ax.twinx()
+        gm_ax = ax.twinx() if show_vtgm_overlay else None
         gm_plotted = False
 
         def plot_curve(ax, curve: pd.DataFrame, label: str, vtgm_details: dict[str, Any] | None = None) -> bool:
@@ -1813,7 +1825,12 @@ class MainWindow(QMainWindow):
                 label=label,
             )
             line_color = ax.lines[-1].get_color()
-            if vtgm_details and vtgm_details.get("vg_v") is not None and vtgm_details.get("original_id_a") is not None:
+            if (
+                show_vtgm_overlay
+                and vtgm_details
+                and vtgm_details.get("vg_v") is not None
+                and vtgm_details.get("original_id_a") is not None
+            ):
                 highlight_y = float(vtgm_details["original_id_a"]) * y_scale
                 if use_abs_log:
                     highlight_y = abs(highlight_y)
@@ -1837,30 +1854,52 @@ class MainWindow(QMainWindow):
                         linestyle="None",
                         zorder=6,
                     )
+                slope_display = float(vtgm_details.get("gm_a_per_v", 0.0)) * y_scale
+                if not math.isclose(slope_display, 0.0, abs_tol=1e-30):
+                    point_x = float(vtgm_details["vg_v"])
+                    intercept_x = float(vtgm_details.get("x_intercept_v", point_x))
+                    tangent_x = np.linspace(point_x, intercept_x, 100)
+                    tangent_y = highlight_y + slope_display * (tangent_x - point_x)
+                    if use_abs_log:
+                        tangent_y = np.abs(tangent_y)
+                        valid_tangent = tangent_y > 0
+                    else:
+                        valid_tangent = np.isfinite(tangent_y)
+                    if np.any(valid_tangent):
+                        ax.plot(
+                            tangent_x[valid_tangent],
+                            tangent_y[valid_tangent],
+                            color="red",
+                            linewidth=0.9,
+                            linestyle="-.",
+                            alpha=0.9,
+                            label="_nolegend_",
+                        )
 
-            derivative_x, derivative_y, smooth_gm_x, smooth_gm_y = self._curve_derivative_series(curve, y_scale)
-            if len(derivative_x) > 0:
-                gm_ax.plot(
-                    derivative_x,
-                    derivative_y,
-                    linestyle="--",
-                    linewidth=1.2,
-                    color=line_color,
-                    alpha=0.9,
-                    label=f"{label} dId/dVg",
-                )
-                gm_plotted = True
-            if len(smooth_gm_x) > 0:
-                gm_ax.plot(
-                    smooth_gm_x,
-                    smooth_gm_y,
-                    linestyle="-",
-                    linewidth=0.9,
-                    color="#000000",
-                    alpha=0.95,
-                    label=f"{label} dId/dVg (SG)",
-                )
-                gm_plotted = True
+            if show_vtgm_overlay and gm_ax is not None:
+                derivative_x, derivative_y, smooth_gm_x, smooth_gm_y = self._curve_derivative_series(curve, y_scale)
+                if len(derivative_x) > 0:
+                    gm_ax.plot(
+                        derivative_x,
+                        derivative_y,
+                        linestyle="--",
+                        linewidth=1.2,
+                        color=line_color,
+                        alpha=0.9,
+                        label=f"{label} dId/dVg",
+                    )
+                    gm_plotted = True
+                if len(smooth_gm_x) > 0:
+                    gm_ax.plot(
+                        smooth_gm_x,
+                        smooth_gm_y,
+                        linestyle="-",
+                        linewidth=0.9,
+                        color="#000000",
+                        alpha=0.95,
+                        label="_nolegend_",
+                    )
+                    gm_plotted = True
             return True
 
         high_label = f"Sat Vd: {config['high_bias_value']}" if config["bias_mode"] == "by_column" else "Sat Vd"
@@ -1894,7 +1933,7 @@ class MainWindow(QMainWindow):
             ax.set_yscale("log")
         ax.yaxis.set_major_formatter(FuncFormatter(self._axis_tick_label))
         ax.yaxis.offsetText.set_visible(False)
-        if gm_plotted:
+        if gm_plotted and gm_ax is not None:
             gm_ax.set_ylabel(f"dId/dVg ({y_unit}/V)")
             gm_ax.yaxis.set_major_formatter(FuncFormatter(self._axis_tick_label))
             gm_ax.yaxis.offsetText.set_visible(False)
@@ -1904,7 +1943,8 @@ class MainWindow(QMainWindow):
             lines_2, labels_2 = gm_ax.get_legend_handles_labels()
             ax.legend(lines_1 + lines_2, labels_1 + labels_2)
         else:
-            gm_ax.set_visible(False)
+            if gm_ax is not None:
+                gm_ax.set_visible(False)
             ax.legend()
         self.canvas.figure.suptitle(f"{result.display_key} | IdVg")
 
